@@ -107,7 +107,9 @@ class PreferenceCompiler:
             return self._empty()
 
     def _compile_one(self, api: Any, pref: Any) -> dict[str, Any]:
-        """编译单条偏好(按单条哈希缓存)。弱模型偶发漏抽 → 结果全空时重试至多 3 次。"""
+        """编译单条偏好(按单条哈希缓存)。【3 票共识】：同一条原文独立编译 3 次，
+        规范化签名取多数票——既防偶发漏抽，又把"一次误读"压成需要"两次相同误读"，
+        显著降低编译层方差(一次配额误读=±1万级摆动)。全不同则取第 1 票并告警。"""
         pkey = _digest(pref)
         if pkey in self._one_cache:
             return self._one_cache[pkey]
@@ -117,11 +119,20 @@ class PreferenceCompiler:
             {"role": "system", "content": COMPILER_SYSTEM},
             {"role": "user", "content": json.dumps({"偏好原文": [pref]}, ensure_ascii=False)},
         ]
-        ir = self._empty()
+        votes: list[dict[str, Any]] = []
         for _ in range(3):
-            ir = self._normalize(llm.chat_json(api, messages, max_tokens=700))
-            if self._nonempty(ir):
-                break
+            r = self._normalize(llm.chat_json(api, messages, max_tokens=700))
+            if self._nonempty(r):
+                votes.append(r)
+        ir = self._empty()
+        if votes:
+            sigs = [json.dumps(v, sort_keys=True, ensure_ascii=False) for v in votes]
+            best = max(sigs, key=sigs.count)
+            if sigs.count(best) >= 2:
+                ir = json.loads(best)
+            else:
+                ir = votes[0]
+                _logger.warning("编译3票全不同,取第1票: %s", str(content)[:50])
         self._one_cache[pkey] = ir
         return ir
 

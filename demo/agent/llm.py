@@ -14,11 +14,13 @@ _logger = logging.getLogger("agent.llm")
 def chat_json(api: Any, messages: list[dict[str, Any]], *, max_tokens: int = 700) -> dict[str, Any] | None:
     """请求一个 JSON 对象动作，返回解析后的 dict；全部尝试失败返回 None。"""
     variants = [
-        # 首选：关 thinking + 限长 + 强制 JSON（flash 上省时省钱；plus 上若接受同样适用）
+        # 首选：temperature=0(同输入同输出,降方差) + 关 thinking + 限长 + 强制 JSON
+        {"messages": messages, "response_format": {"type": "json_object"}, "enable_thinking": False, "max_tokens": max_tokens, "temperature": 0},
+        # 去掉 temperature(以防评测网关拒收该参数)
         {"messages": messages, "response_format": {"type": "json_object"}, "enable_thinking": False, "max_tokens": max_tokens},
         # 去掉 max_tokens（以防限长截断 JSON）
         {"messages": messages, "response_format": {"type": "json_object"}, "enable_thinking": False},
-        # 退路：去掉 enable_thinking（若评测模型(如 qwen3.7-plus)不接受该参数则改走这里，避免彻底失败）
+        # 退路：去掉 enable_thinking（若评测模型不接受该参数则改走这里，避免彻底失败）
         {"messages": messages, "response_format": {"type": "json_object"}, "max_tokens": max_tokens},
         {"messages": messages, "response_format": {"type": "json_object"}},
         # 最后退路：连 response_format 也去掉（宁可慢/松也别返回 None）

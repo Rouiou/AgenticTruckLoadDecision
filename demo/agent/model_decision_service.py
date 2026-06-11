@@ -38,6 +38,13 @@ def _now_md(now_wall: str) -> tuple[int, int] | None:
         return None
 
 
+# ===== R1 确定性执行 feature flags（形状参数，零偏好常量）=====
+DECIDE_MODE = "argmax"  # "argmax"=确定性选单 / "hybrid"=argmax提名+LLM单票否决 / "llm"=旧路径(本地影子对照用)
+SHADOW_LOG = False      # True=行为走旧llm路径,同时记录argmax提名(本地分歧率统计用,提交包必须False)
+REQUERY_MIN = 60        # 无正分候选时的再查间隔(分钟)
+SHADOW_CAP = 5000.0     # 配额影子价格封顶(元/单)
+
+
 class ModelDecisionService:
     def __init__(self, api: SimulationApiPort) -> None:
         self._api = api
@@ -171,18 +178,82 @@ class ModelDecisionService:
                         c.setdefault("violates", []).append("会送达到必须整休的整天")
                 except (TypeError, ValueError):
                     pass
+        # 防错过日期任务：会送达到"有未完成专属日程的日子"的单，提前标违规(F6,
+        # 旧版靠选单LLM看提示词隐式规避,确定性选单必须显式化,否则机械爽约)
+        pending_days = self._pending_task_days(driver_id, directive, now_min)
+        if pending_days:
+            for c in candidates:
+                try:
+                    if (int(c.get("est_finish_min") or now_min) // 1440) in pending_days:
+                        c.setdefault("violates", []).append("会占用有专属日程的日子")
+                except (TypeError, ValueError):
+                    pass
         # —— 月度单数上限(如 >8h 长途 ≤N/月)：本月已达上限 → 命中谓词的候选标违规(LLM/反闲置都不接) ——
         self._mark_monthly_caps(driver_id, ir, now_wall, candidates)
         for c in candidates:
             self._memory.note_candidate(driver_id, c["cargo_id"], c)
 
-        # —— 品类配额履约(确定性，优先级高于 LLM 的 ROI 选单)：本月必须接满 N 单某品类 ——
-        # 接一单"还差的配额品类"省下的罚款(数千) ≫ 单票利润，故仅次于作息硬休息；品类/单数/月份全来自 LLM 编译。
-        forced_q = self._quota_action(
-            driver_id, status, ir, now_min, now_wall, month_end_min, candidates, windows, off_set
+        # —— 品类配额履约：llm 模式走旧"顺路履约"强制路径；argmax/hybrid 模式由
+        # 影子价格统一接管(配额货加边际罚款分后与普通货同台竞争,经济权衡自动完成) ——
+        if DECIDE_MODE == "llm" or SHADOW_LOG:
+            forced_q = self._quota_action(
+                driver_id, status, ir, now_min, now_wall, month_end_min, candidates, windows, off_set
+            )
+            if forced_q is not None:
+                return forced_q
+
+        # ========== R1 确定性选单 ==========
+        # 打分=有效时薪+配额影子价格(tools.score_candidate)；硬过滤=violates(含IR过滤/整休/
+        # 日期任务/月上限标注)+不跨休息窗(60缓冲)。argmax 替代每步 LLM 选单：
+        # 消除±20k选单方差、省token、时薪目标函数治"绝对额排序看不见等窗时间"。
+        shadow_map = self._build_shadow_map(driver_id, ir, now_wall, month_end_min, now_min)
+        clean = [
+            c
+            for c in candidates
+            if not c.get("violates")
+            and not checker.overlaps_any_window(now_min, int(c.get("est_finish_min") or now_min), windows)
+        ]
+        scored = sorted(
+            ((tools.score_candidate(c, now_min, shadow_map), c) for c in clean),
+            key=lambda x: x[0],
+            reverse=True,
         )
-        if forced_q is not None:
-            return forced_q
+        positive = [(s, c) for s, c in scored if s > 0]
+        if SHADOW_LOG:
+            top = positive[0] if positive else None
+            self._logger.info(
+                "shadow argmax driver=%s 提名=%s score=%.2f shadow_cats=%s",
+                driver_id,
+                top[1]["cargo_id"] if top else "wait",
+                top[0] if top else 0.0,
+                list(shadow_map),
+            )
+        if DECIDE_MODE in ("argmax", "hybrid") and not SHADOW_LOG:
+            if positive:
+                pick = None
+                if DECIDE_MODE == "hybrid":
+                    # LLM 单票否决(权限棘轮:只能说"不",不能换单)；至多问前2名,全否则等待
+                    prefs_text = [str(p.get("content") or "") for p in (status.get("preferences") or [])]
+                    for s, c in positive[:2]:
+                        if not self._llm_veto(api, c, prefs_text):
+                            pick = (s, c)
+                            break
+                else:
+                    pick = positive[0]
+                if pick is not None:
+                    s, c = pick
+                    self._logger.info(
+                        "decide driver=%s t=%s cand=%s -> argmax take %s rate=%.2f shadow=%s",
+                        driver_id, now_min, len(candidates), c["cargo_id"], s,
+                        str(c.get("cargo_name") or "") in shadow_map,
+                    )
+                    return {"action": "take_order", "params": {"cargo_id": c["cargo_id"]}}
+            act = self._wait_action(now_min, windows)
+            self._logger.info(
+                "decide driver=%s t=%s cand=%s -> argmax wait %s", driver_id, now_min, len(candidates), act["params"]
+            )
+            return act
+        # ========== 旧 LLM 选单路径(DECIDE_MODE=="llm" 或 SHADOW_LOG 影子对照) ==========
 
         region_hint = ""
         rt = directive.get("region_target") if isinstance(directive, dict) else None
@@ -323,6 +394,104 @@ class ModelDecisionService:
             action.get("params"),
         )
         return action
+
+    def _build_shadow_map(
+        self, driver_id: str, ir: dict[str, Any], now_wall: str, month_end_min: int, now_min: int
+    ) -> dict[str, float]:
+        """配额影子价格表 {真实品类名: 边际罚款}。只给【落后且按配速来不及】的配额加价——
+        来得及的配额货按自然时薪竞争(顺路凑,零额外成本)。品类名经等值对齐(评分按完全相等计数)；
+        无法对齐(unmapped)不强制履约。全部数值来自 LLM 编译 IR + 客观计数,零偏好常量。绝不抛异常。"""
+        out: dict[str, float] = {}
+        try:
+            cmd = _now_md(now_wall)
+            if not cmd:
+                return out
+            cur_month = cmd[0]
+            days_passed = max(0, int(cmd[1]) - 1)
+            days_left = max(0, (month_end_min - now_min) // 1440)
+            known = self._memory.cargo_names(driver_id)
+            for q in ir.get("category_quotas") or []:
+                if int(q.get("month") or 0) != cur_month:
+                    continue
+                cat = str(q.get("category") or "").strip()
+                need = int(q.get("min_orders") or 0)
+                if not cat or need <= 0:
+                    continue
+                done = self._memory.category_orders_done(driver_id, cat, cur_month)
+                remaining = need - done
+                if remaining <= 0:
+                    continue
+                projected = (done / max(1, days_passed)) * days_left
+                if projected >= remaining and days_left > remaining + 2:
+                    continue  # 按当前节奏来得及 → 不加价,顺路自然竞争
+                snapped, st = tools.snap_category(cat, known)
+                if st == "unmapped":
+                    continue  # 无法对齐到真实品类名 → 不强制(原文仍在偏好提示里)
+                ppu = float(q.get("penalty_per_unit") or 0.0)
+                out[snapped] = min(ppu if ppu > 0 else SHADOW_CAP, SHADOW_CAP)
+        except Exception as e:
+            self._logger.warning("shadow_map 构造失败: %s", e)
+        return out
+
+    def _wait_action(self, now_min: int, windows: list[Any]) -> dict[str, Any]:
+        """无正分候选时的确定性等待：睡到 min(下一休息窗开始, 当天结束, 再查间隔)。
+        纯时间算术；休息窗来自 LLM 编译。"""
+        day = now_min // 1440
+        tod = now_min - day * 1440
+        cands = [now_min + REQUERY_MIN, (day + 1) * 1440]
+        for s, e in windows or []:
+            cands.append(day * 1440 + (s if s > tod else s + 1440))
+        until = min(cands)
+        dur = max(1, min(until - now_min, guardrails.MAX_WAIT_MINUTES))
+        return {"action": "wait", "params": {"duration_minutes": dur}}
+
+    def _llm_veto(self, api: Any, c: dict[str, Any], prefs_text: list[str]) -> bool:
+        """hybrid 模式的单票否决：LLM 通读全部偏好原文,只回答"接这单是否违反任何偏好"。
+        权限棘轮——LLM 只能否决,不能改选其他单。失败(None)按不否决处理(下界=argmax)。"""
+        try:
+            q = {
+                "候选": {
+                    "品类": c.get("cargo_name"),
+                    "起点": (c.get("start") or {}).get("city"),
+                    "终点": (c.get("end") or {}).get("city"),
+                    "赴装空驶km": c.get("deadhead_km"),
+                    "干线分钟": c.get("cost_time_minutes"),
+                    "预计完成时刻": c.get("预计完成时刻"),
+                },
+                "司机偏好原文": prefs_text,
+                "问题": '只判断:接这一单是否会违反上述任一偏好?只输出 JSON {"veto":true/false,"reason":"一句话"}',
+            }
+            obj = llm.chat_json(
+                api, [{"role": "user", "content": json.dumps(q, ensure_ascii=False)}], max_tokens=120
+            )
+            return bool(obj and obj.get("veto"))
+        except Exception:
+            return False
+
+    def _pending_task_days(self, driver_id: str, directive: dict[str, Any], now_min: int) -> set[int]:
+        """未完成日期任务所在的日序号集合(供候选标违规,防接单溢入专属日程日)。绝不抛异常。"""
+        out: set[int] = set()
+        try:
+            from datetime import datetime
+
+            today = now_min // 1440
+            for t in directive.get("dated_tasks") or []:
+                md = _parse_md(t.get("date", ""))
+                if not md:
+                    continue
+                try:
+                    d = (datetime(2026, md[0], md[1]) - tools.EPOCH).days
+                except ValueError:
+                    continue
+                if d < today:
+                    continue
+                key = "%s@%.4f,%.4f" % (t["date"], t["lat"], t["lng"])
+                if self._memory.is_dated_done(driver_id, key):
+                    continue
+                out.add(d)
+        except Exception as e:
+            self._logger.warning("pending_task_days 失败: %s", e)
+        return out
 
     def _obligation_action(
         self,

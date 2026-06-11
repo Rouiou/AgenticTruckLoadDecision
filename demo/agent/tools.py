@@ -92,6 +92,30 @@ def _dead_minutes(distance_km: float) -> int:
     return max(1, math.ceil(distance_km / SPEED_ASSUMED_KMH * 60))
 
 
+def score_candidate(c: dict[str, Any], now_min: int, shadow_map: dict[str, float] | None = None) -> float:
+    """确定性选单打分 = 有效时薪(元/分钟) + 配额影子价格。
+    - 有效时薪 = 净收益 / 占用分钟。占用 = 预计完成 − 现在(含空驶+等装货窗+干线)，
+      下限取干线时长(防压线短单/等窗被低估时时薪发散)。
+    - 影子价格：候选品类若命中【落后且按配速来不及】的配额，加一单的边际罚款
+      (接这单额外避免一单欠额罚)——"凑配额 vs 接高时薪货"由同一把尺自动权衡，
+      替代人工履约档位。全部数值来自 LLM 编译的 IR 与客观计数，零偏好常量。"""
+    try:
+        net = float(c.get("price") or 0.0) - COST_PER_KM_ASSUMED * (
+            float(c.get("deadhead_km") or 0.0) + float(c.get("haul_km") or 0.0)
+        )
+        busy = max(
+            int(c.get("est_finish_min") or now_min) - now_min,
+            int(c.get("cost_time_minutes") or 0),
+            1,
+        )
+        shadow = 0.0
+        if shadow_map:
+            shadow = float(shadow_map.get(str(c.get("cargo_name") or ""), 0.0))
+        return (net + shadow) / busy
+    except (TypeError, ValueError):
+        return -1.0
+
+
 def snap_category(kw: str, known: set[str]) -> tuple[str, str]:
     """把 LLM 编译出的品类关键词对齐到【运行时见过的真实品类名全集】(query 返回累积,零硬编码)。
     评分按 cargo_name 与品类【完全相等】计数——关键词若与真实品类名不完全一致,
