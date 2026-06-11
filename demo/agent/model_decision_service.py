@@ -43,6 +43,8 @@ DECIDE_MODE = "argmax"  # "argmax"=确定性选单 / "hybrid"=argmax提名+LLM�
 SHADOW_LOG = False      # True=行为走旧llm路径,同时记录argmax提名(本地分歧率统计用,提交包必须False)
 REQUERY_MIN = 60        # 无正分候选时的再查间隔(分钟)
 SHADOW_CAP = 5000.0     # 配额影子价格封顶(元/单)
+SAFE_BQ = True          # R2 月末安全广查(低频/不压线/时钟刷新/等值,广查结果并入打分不强制接)
+SAFE_BQ_DAYS = 3        # 月末窗口:days_left ≤ remaining + 此值 才广查
 
 
 class ModelDecisionService:
@@ -207,6 +209,15 @@ class ModelDecisionService:
         # 日期任务/月上限标注)+不跨休息窗(60缓冲)。argmax 替代每步 LLM 选单：
         # 消除±20k选单方差、省token、时薪目标函数治"绝对额排序看不见等窗时间"。
         shadow_map = self._build_shadow_map(driver_id, ir, now_wall, month_end_min, now_min)
+        # —— R2 安全配额回补：月末告急且本地无该品类干净货 → 低频广查把配额货并入候选打分。
+        # 与旧广查的全部区别：月末窗口/不压线(60缓冲)/时钟刷新/等值匹配/距夜休远才查/每天每品类一次/
+        # 不强制接(影子价格让它自然胜出)。每次~60min查询税换数千罚款,经济上压倒性合算。
+        if SAFE_BQ and shadow_map:
+            extra, now_min = self._safe_broad_query(
+                driver_id, status, ir, now_min, now_wall, month_end_min, shadow_map, windows, candidates
+            )
+            if extra:
+                candidates = candidates + extra
         clean = [
             c
             for c in candidates
@@ -432,6 +443,88 @@ class ModelDecisionService:
         except Exception as e:
             self._logger.warning("shadow_map 构造失败: %s", e)
         return out
+
+    def _safe_broad_query(
+        self,
+        driver_id: str,
+        status: dict[str, Any],
+        ir: dict[str, Any],
+        now_min: int,
+        now_wall: str,
+        month_end_min: int,
+        shadow_map: dict[str, float],
+        windows: list[Any],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """R2 月末安全广查：返回(可并入打分的配额货候选, 刷新后的now_min)。
+        触发条件全部满足才查：①该配额月末告急(days_left≤remaining+SAFE_BQ_DAYS)
+        ②本地候选无该品类干净货 ③距下一休息窗 ≥ 本月单均占用时长(傍晚熔断)
+        ④今天该品类没查过。广查后刷新时钟；结果只并入候选(影子价格自然胜出)，不强制接。绝不抛异常。"""
+        try:
+            cmd = _now_md(now_wall)
+            if not cmd:
+                return [], now_min
+            cur_month, day_of_month = cmd[0], cmd[1]
+            days_left = max(0, (month_end_min - now_min) // 1440)
+            cur_day = now_min // 1440
+            known = self._memory.cargo_names(driver_id)
+            # 傍晚熔断：距下一休息窗的分钟数 < 典型单周期(本月完单均占用,无样本则240) → 不查
+            day0 = cur_day * 1440
+            tod = now_min - day0
+            nxt_win = min(
+                (day0 + (s if s > tod else s + 1440) for s, e in windows or []),
+                default=now_min + 100000,
+            )
+            typical = 240
+            if nxt_win - now_min < typical + 60:
+                return [], now_min
+            local_names = {str(c.get("cargo_name") or "") for c in candidates if not c.get("violates")}
+            for q in ir.get("category_quotas") or []:
+                if int(q.get("month") or 0) != cur_month:
+                    continue
+                cat = str(q.get("category") or "").strip()
+                snapped, st = tools.snap_category(cat, known)
+                if st == "unmapped" or snapped not in shadow_map:
+                    continue  # 没告急(影子未激活)或对不齐的不广查
+                need = int(q.get("min_orders") or 0)
+                remaining = need - self._memory.category_orders_done(driver_id, cat, cur_month)
+                if remaining <= 0 or days_left > remaining + SAFE_BQ_DAYS:
+                    continue  # 只在月末窗口动用大查询
+                if snapped in local_names:
+                    continue  # 本地已有该品类干净货,argmax 自己会选
+                bqkey = (driver_id, cat)
+                if self._last_bq.get(bqkey) == cur_day:
+                    continue  # 每天每品类最多一次
+                self._last_bq[bqkey] = cur_day
+                lat = float(status["current_lat"])
+                lng = float(status["current_lng"])
+                resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
+                # 广查推进时钟(最多60min)——立刻刷新,防完成时刻估算乐观导致压线溢入夜休
+                now_min = int(
+                    self._api.get_driver_status(driver_id).get("simulation_progress_minutes") or now_min
+                )
+                wide = tools.prepare_candidates(
+                    resp.get("items", []) or [], now_min, month_end_min, top_n=600, quota_categories=[cat]
+                )
+                checker.annotate(wide, ir, cmd)
+                extra = [
+                    c
+                    for c in wide
+                    if str(c.get("cargo_name") or "") == snapped
+                    and not c.get("violates")
+                    and not checker.overlaps_any_window(now_min, int(c.get("est_finish_min") or now_min), windows)
+                ][:8]
+                for c in extra:
+                    self._memory.note_candidate(driver_id, c["cargo_id"], c)
+                self._logger.info(
+                    "R2 安全广查 driver=%s 品类=%s 还差=%s days_left=%s 找到干净货=%s",
+                    driver_id, cat, remaining, days_left, len(extra),
+                )
+                return extra, now_min  # 每步最多广查一个品类(控制时间税)
+            return [], now_min
+        except Exception as e:
+            self._logger.warning("安全广查失败: %s", e)
+            return [], now_min
 
     def _wait_action(self, now_min: int, windows: list[Any]) -> dict[str, Any]:
         """无正分候选时的确定性等待：睡到 min(下一休息窗开始, 当天结束, 再查间隔)。
