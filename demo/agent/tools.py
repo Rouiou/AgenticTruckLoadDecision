@@ -92,6 +92,25 @@ def _dead_minutes(distance_km: float) -> int:
     return max(1, math.ceil(distance_km / SPEED_ASSUMED_KMH * 60))
 
 
+def snap_category(kw: str, known: set[str]) -> tuple[str, str]:
+    """把 LLM 编译出的品类关键词对齐到【运行时见过的真实品类名全集】(query 返回累积,零硬编码)。
+    评分按 cargo_name 与品类【完全相等】计数——关键词若与真实品类名不完全一致,
+    我方会"自以为凑满、官方照罚"。返回 (对齐后词, 状态):
+    exact=本身就是完整品类名; snapped=唯一子串/超串对齐; unmapped=无法唯一对齐(调用方降级)。"""
+    kw = str(kw or "").strip()
+    if not kw:
+        return kw, "unmapped"
+    if kw in known:
+        return kw, "exact"
+    sup = [n for n in known if kw in n]
+    if len(sup) == 1:
+        return sup[0], "snapped"
+    sub = [n for n in known if n in kw]
+    if len(sub) == 1:
+        return sub[0], "snapped"
+    return kw, "unmapped"
+
+
 def estimate_finish_min(now_min: int, deadhead_km: float, load_time: Any, cost_time: int) -> int:
     """预计真实完成时刻(分钟)，镜像 simkit：max(到达装货点, 装货窗开始) + 干线时长。
     纯客观物理时间(空驶+等装货窗+干线)，与任何偏好无关。"""

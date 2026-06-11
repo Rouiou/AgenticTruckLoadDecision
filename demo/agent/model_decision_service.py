@@ -154,6 +154,10 @@ class ModelDecisionService:
         # get_driver_status 不耗仿真时间，刷新即修复。纯客观时钟同步，与偏好无关。
         now_min = int(api.get_driver_status(driver_id).get("simulation_progress_minutes") or now_min)
         items = resp.get("items", []) or []
+        # 累积真实品类名词表(客观事实,供配额关键词等值对齐——评分按完全相等计数)
+        self._memory.note_cargo_names(
+            driver_id, ((it.get("cargo") or {}).get("cargo_name") for it in items if isinstance(it, dict))
+        )
         active_cats = self._active_quota_categories(driver_id, ir, now_wall)
         candidates = tools.prepare_candidates(
             items, now_min, month_end_min, top_n=10, quota_categories=active_cats
@@ -437,10 +441,18 @@ class ModelDecisionService:
                     except (TypeError, ValueError):
                         pass
 
+            # 配额关键词等值对齐：评分按 cargo_name 与品类【完全相等】计数，履约判定必须同口径，
+            # 否则把超串品类(如"其他X")的单计入配额→自以为凑满、评分照罚。
+            known = self._memory.cargo_names(driver_id)
+            snap_map = {cat: tools.snap_category(cat, known) for _q, cat, _r in active}
+
             def _clean(c: dict[str, Any], cat: str) -> bool:
                 # 配额货与普通单同用 60min 防撞余量(不再压线)：官方读数显示压线/高力度履约
                 # 在隐藏司机上的副作用罚款 ≫ 它省下的配额罚款，宁可少凑一单不赌作息。
-                if cat not in str(c.get("cargo_name") or "") or c.get("violates"):
+                name = str(c.get("cargo_name") or "")
+                snapped, st = snap_map.get(cat) or (cat, "unmapped")
+                matched = (name == snapped) if st != "unmapped" else (cat in name)
+                if not matched or c.get("violates"):
                     return False
                 est = int(c.get("est_finish_min") or now_min)
                 if checker.overlaps_any_window(now_min, est, windows):

@@ -36,7 +36,20 @@ class DriverMemory:
         return {
             "ingested": 0, "events": [], "cargo": {}, "last_progress": None,
             "planned_day": None, "directive": {}, "dated_done": set(),
+            "cargo_names": set(),  # 运行时见过的真实品类名全集(query 返回累积,供等值对齐)
         }
+
+    def note_cargo_names(self, driver_id: str, names: Any) -> None:
+        """累积 query_cargo 返回里见过的品类名(客观事实,零硬编码)。供 snap_category 等值对齐。"""
+        d = self._mem.setdefault(driver_id, self._fresh())
+        s = d.setdefault("cargo_names", set())
+        for n in names or []:
+            n = str(n or "").strip()
+            if n:
+                s.add(n)
+
+    def cargo_names(self, driver_id: str) -> set[str]:
+        return self._mem.get(driver_id, {}).get("cargo_names") or set()
 
     def region_days_done(self, driver_id: str, keyword: str) -> set[int]:
         """已在含 keyword 地名(起或终点)成功接单的【不同日期序号集合】。keyword 来自 LLM 编译。"""
@@ -51,18 +64,22 @@ class DriverMemory:
         return days
 
     def category_orders_done(self, driver_id: str, keyword: str, month: int) -> int:
-        """本月(自然月 month)已【成功接单】、品类(cargo_name)含 keyword 的【单数】。
-        供品类配额履约用。keyword/month 均来自 LLM 编译，代码只做文本包含 + 计数(零偏好常量)。"""
+        """本月(自然月 month)已【成功接单】、品类匹配 keyword 的【单数】。供品类配额履约用。
+        匹配口径与评分对齐：cargo_name 与品类名【完全相等】(先 snap_category 把编译关键词
+        对齐到运行时见过的真实品类名；无法唯一对齐时回退"包含"——宁可多算保守不停手)。
+        keyword/month 来自 LLM 编译，代码只做对齐 + 计数(零偏好常量)。"""
         d = self._mem.get(driver_id)
         if not d or not keyword:
             return 0
+        snapped, st = tools.snap_category(keyword, d.get("cargo_names") or set())
         cnt = 0
         for ev in d["events"]:
             if ev.get("action") != "take_order" or not ev.get("accepted"):
                 continue
             if ev.get("month") != month:
                 continue
-            if keyword in str(ev.get("cargo_name") or ""):
+            name = str(ev.get("cargo_name") or "")
+            if (name == snapped) if st != "unmapped" else (keyword in name):
                 cnt += 1
         return cnt
 
