@@ -54,6 +54,27 @@ def _norm_dated_tasks(v: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _norm_avoid_filters(v: Any) -> list[dict[str, Any]]:
+    """planner 的当日规避过滤(与编译器 order_filters 同构)：只接受白名单字段与算子。"""
+    out: list[dict[str, Any]] = []
+    if isinstance(v, list):
+        for f in v:
+            if not isinstance(f, dict):
+                continue
+            field = str(f.get("field", "")).strip()
+            op = str(f.get("op", "")).strip()
+            if field in ("cargo_name", "start_city", "end_city", "deadhead_km") and op in ("contains", "gt"):
+                out.append(
+                    {
+                        "field": field,
+                        "op": op,
+                        "value": f.get("value"),
+                        "raw_text": str(f.get("raw_text", "") or ""),
+                    }
+                )
+    return out[:6]
+
+
 def _norm_region_target(v: Any) -> dict[str, Any] | None:
     if not isinstance(v, dict):
         return None
@@ -84,7 +105,10 @@ PLANNER_SYSTEM = (
     '【多站点行程】(如先到 A 再到 B)请按到访顺序拆成多条(同一 date、先到的排前面)；只路过不久留的站点 wait_minutes 填 1；有"几点前到"的截止就尽早安排。没有则空数组,'
     '"region_target":{"keyword":"地名关键词","lat":数值,"lng":数值,"need_days":整数} 【仅限真实地理地名】针对【在某地名累计接单需≥N个不同日】类偏好：地名关键词 + 该地代表坐标 + 需要的不同天数(均从原文读)；'
     '【严禁】把"某品类货必须接满 N 单"(品类配额，如某类货物指标)当成 region_target——品类不是地名、由别的模块处理，这里只放真实地名；没有地名累计类偏好则 null,'
-    '"monthly_todo":"对照台账，本月还没完成的整月类义务及缺口 + 建议何时做（如：某累计型地域偏好还差 N 个不同日；某具体日期的行程在 X 天后、今明别接会拖到那时的单；还差 N 个整休日）"}'
+    '"monthly_todo":"对照台账，本月还没完成的整月类义务及缺口 + 建议何时做（如：某累计型地域偏好还差 N 个不同日；某具体日期的行程在 X 天后、今明别接会拖到那时的单；还差 N 个整休日）",'
+    '"avoid_filters":[{"field":"cargo_name 或 start_city 或 end_city 或 deadhead_km","op":"contains 或 gt","value":值,"raw_text":"依据的偏好原文"}] '
+    "【查漏补缺】逐条对照偏好原文：今天接单时必须规避、且无法用上述其他字段表达的事项（尤其是措辞特殊/结构化不了的规避型偏好），"
+    "按候选字段写成过滤条件(contains 填关键词或数组,gt 填数值)。只写【规避型】(不接什么)，不写必做型；已被常规理解覆盖的不必重复；没有则空数组。}"
 )
 
 
@@ -121,6 +145,7 @@ def plan_day(
             "rest_block_today": _norm_rest_block(obj.get("rest_block_today")),
             "dated_tasks": _norm_dated_tasks(obj.get("dated_tasks")),
             "region_target": _norm_region_target(obj.get("region_target")),
+            "avoid_filters": _norm_avoid_filters(obj.get("avoid_filters")),
         }
         _logger.info("planner directive: %s", json.dumps(directive, ensure_ascii=False))
         return directive

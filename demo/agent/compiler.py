@@ -47,8 +47,10 @@ COMPILER_SYSTEM = (
     "字段：category=该品类关键词(对应候选 cargo_name，取'货源类型是XX的货'里的 XX)；min_orders=N(中文数字也要转，如'十二'=12)；month=所属自然月1-12('四月'→4、'五月'→5)；active_from/active_to=该月起止(如 4-1 / 4-30)；penalty_per_unit=少一单罚款额；"
     "unrecoverable：偏好写明【本月欠额结转下月继续扣 / 过期不可补】填 true，否则 false。\n"
     "区分：'不接/禁接某品类'→order_filters；'必须接满 N 单某品类'→category_quotas。\n"
-    "monthly_count_caps 表示【每月对某类单的【数量上限】】：如'每月超过 N 小时的长途/远活最多接 M 单，多一单扣一次'。"
-    "field 填 cost_time_minutes(订单干线时长，分钟)；op 填 gt；threshold 填该时长阈值的【分钟数】(如'八小时/8小时'→480、'十小时'→600)；max_per_month 填每月最多单数 M；penalty_per_unit 填超一单罚款额。没有这类上限则空数组。\n"
+    "monthly_count_caps 表示【每月对某类单的数量【上限或下限】】：上限如'每月超过 N 小时的长途最多接 M 单，多一单扣一次'；"
+    "下限如'每月长途/远活【至少/不能少于】接 M 单，少一单扣一次'。"
+    "field 填 cost_time_minutes(订单干线时长，分钟)；op 填 gt；threshold 填该时长阈值的【分钟数】(如'八小时/8小时'→480、'十小时'→600)；"
+    "上限填 max_per_month=M(下限则该字段填 null)；下限填 min_per_month=M(上限则填 null)；penalty_per_unit 填差/超一单的罚款额。没有这类则空数组。\n"
     "示例：偏好'五月玩具类的货必须接满八单，少一单扣300' → category_quotas 含 {\"category\":\"玩具\",\"min_orders\":8,\"month\":5,\"active_from\":\"5-1\",\"active_to\":\"5-31\",\"penalty_per_unit\":300,\"unrecoverable\":false}。\n"
     "其余需跨天规划的(某地累计去够 N 个不同日、某具体日期到某地办事)仍【不要】放进来，由别的模块处理。"
 )
@@ -213,10 +215,20 @@ class PreferenceCompiler:
             field = str(cap.get("field", "") or "").strip()
             try:
                 thr = float(cap.get("threshold"))
-                maxm = int(cap.get("max_per_month"))
             except (TypeError, ValueError):
                 continue
-            if not field or maxm < 0:
+            maxm = cap.get("max_per_month")
+            minm = cap.get("min_per_month")
+            try:
+                maxm = int(maxm) if maxm is not None else None
+            except (TypeError, ValueError):
+                maxm = None
+            try:
+                minm = int(minm) if minm is not None else None
+            except (TypeError, ValueError):
+                minm = None
+            # 双向槽位：上限/下限至少有一个(防"最少接N单长途"类下限偏好被静默丢弃)
+            if not field or (maxm is None and minm is None) or (maxm or 0) < 0 or (minm or 0) < 0:
                 continue
             try:
                 ppu = float(cap.get("penalty_per_unit") or cap.get("penalty_per_miss") or cap.get("penalty") or 0)
@@ -228,6 +240,7 @@ class PreferenceCompiler:
                     "op": str(cap.get("op", "gt") or "gt").strip(),
                     "threshold": thr,
                     "max_per_month": maxm,
+                    "min_per_month": minm,
                     "penalty_per_unit": ppu,
                     "raw_text": str(cap.get("raw_text", "") or ""),
                 }

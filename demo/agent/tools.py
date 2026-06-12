@@ -108,9 +108,9 @@ def score_candidate(c: dict[str, Any], now_min: int, shadow_map: dict[str, float
             int(c.get("cost_time_minutes") or 0),
             1,
         )
-        shadow = 0.0
+        shadow = float(c.get("_pred_bonus") or 0.0)  # 月度数量下限的影子价格(service 注入)
         if shadow_map:
-            shadow = float(shadow_map.get(str(c.get("cargo_name") or ""), 0.0))
+            shadow += float(shadow_map.get(str(c.get("cargo_name") or ""), 0.0))
         return (net + shadow) / busy
     except (TypeError, ValueError):
         return -1.0

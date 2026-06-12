@@ -171,7 +171,9 @@ class ModelDecisionService:
         candidates = tools.prepare_candidates(
             items, now_min, month_end_min, top_n=10, quota_categories=active_cats
         )
-        checker.annotate(candidates, ir, _now_md(now_wall))  # 按"当日生效"给候选打违规标签（只标注，不删货）
+        # 按"当日生效"给候选打违规标签(只标注不删货)；planner 的每日查漏规避(avoid_filters,
+        # 编译器未覆盖偏好的当日补丁——确定性选单撤掉每步LLM后的安全网)一并生效
+        checker.annotate(candidates, ir, _now_md(now_wall), extra_filters=directive.get("avoid_filters"))
         # 防溢出：会送达到"必须整休日"的单，提前标违规(否则前一天接的长途会占用整休日凌晨)
         if off_set:
             for c in candidates:
@@ -209,12 +211,16 @@ class ModelDecisionService:
         # 日期任务/月上限标注)+不跨休息窗(60缓冲)。argmax 替代每步 LLM 选单：
         # 消除±20k选单方差、省token、时薪目标函数治"绝对额排序看不见等窗时间"。
         shadow_map = self._build_shadow_map(driver_id, ir, now_wall, month_end_min, now_min)
+        # 月度数量【下限】(如"每月长途至少N单")：落后且来不及 → 给满足谓词的候选加边际罚款分
+        # (与品类配额影子价格同构;时薪排序天然偏短单,无此机制下限型偏好会被机械欠交)
+        self._apply_floor_bonus(driver_id, ir, now_wall, month_end_min, now_min, candidates)
         # —— R2 安全配额回补：月末告急且本地无该品类干净货 → 低频广查把配额货并入候选打分。
         # 与旧广查的全部区别：月末窗口/不压线(60缓冲)/时钟刷新/等值匹配/距夜休远才查/每天每品类一次/
         # 不强制接(影子价格让它自然胜出)。每次~60min查询税换数千罚款,经济上压倒性合算。
         if SAFE_BQ and shadow_map:
             extra, now_min = self._safe_broad_query(
-                driver_id, status, ir, now_min, now_wall, month_end_min, shadow_map, windows, candidates
+                driver_id, status, ir, now_min, now_wall, month_end_min, shadow_map, windows, candidates,
+                directive.get("avoid_filters"),
             )
             if extra:
                 candidates = candidates + extra
@@ -444,6 +450,48 @@ class ModelDecisionService:
             self._logger.warning("shadow_map 构造失败: %s", e)
         return out
 
+    def _apply_floor_bonus(
+        self,
+        driver_id: str,
+        ir: dict[str, Any],
+        now_wall: str,
+        month_end_min: int,
+        now_min: int,
+        candidates: list[dict[str, Any]],
+    ) -> None:
+        """月度数量下限(min_per_month)的影子价格：本月该类单落后且配速来不及 →
+        给满足谓词(field>threshold)的候选加 _pred_bonus=边际罚款。绝不抛异常。"""
+        try:
+            cmd = _now_md(now_wall)
+            if not cmd:
+                return
+            cur_month, day_of_month = cmd[0], cmd[1]
+            days_passed = max(0, int(day_of_month) - 1)
+            days_left = max(0, (month_end_min - now_min) // 1440)
+            for cap in ir.get("monthly_count_caps") or []:
+                minm = cap.get("min_per_month")
+                field = str(cap.get("field") or "").strip()
+                thr = cap.get("threshold")
+                if minm is None or not field or thr is None:
+                    continue
+                done = self._memory.monthly_predicate_count(driver_id, field, float(thr), cur_month)
+                remaining = int(minm) - done
+                if remaining <= 0:
+                    continue
+                projected = (done / max(1, days_passed)) * days_left
+                if projected >= remaining and days_left > remaining + 2:
+                    continue  # 来得及 → 不加价
+                ppu = float(cap.get("penalty_per_unit") or 0.0) or SHADOW_CAP
+                bonus = min(ppu, SHADOW_CAP)
+                for c in candidates:
+                    try:
+                        if float(c.get(field) or 0) > float(thr):
+                            c["_pred_bonus"] = max(float(c.get("_pred_bonus") or 0.0), bonus)
+                    except (TypeError, ValueError):
+                        pass
+        except Exception as e:
+            self._logger.warning("floor_bonus 失败: %s", e)
+
     def _safe_broad_query(
         self,
         driver_id: str,
@@ -455,6 +503,7 @@ class ModelDecisionService:
         shadow_map: dict[str, float],
         windows: list[Any],
         candidates: list[dict[str, Any]],
+        avoid_filters: list[dict[str, Any]] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """R2 月末安全广查：返回(可并入打分的配额货候选, 刷新后的now_min)。
         触发条件全部满足才查：①该配额月末告急(days_left≤remaining+SAFE_BQ_DAYS)
@@ -506,7 +555,7 @@ class ModelDecisionService:
                 wide = tools.prepare_candidates(
                     resp.get("items", []) or [], now_min, month_end_min, top_n=600, quota_categories=[cat]
                 )
-                checker.annotate(wide, ir, cmd)
+                checker.annotate(wide, ir, cmd, extra_filters=avoid_filters)
                 extra = [
                     c
                     for c in wide

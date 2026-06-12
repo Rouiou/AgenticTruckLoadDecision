@@ -82,9 +82,16 @@ def has_dated_restriction_today(ir: dict[str, Any], today_md: tuple[int, int] | 
     return False
 
 
-def annotate(candidates: list[dict[str, Any]], ir: dict[str, Any], today_md: tuple[int, int] | None = None) -> None:
-    """给每个候选打 violates 标签（命中且【当日生效】的偏好原文）。只标注，不删货。"""
-    filters = (ir or {}).get("order_filters") or []
+def annotate(
+    candidates: list[dict[str, Any]],
+    ir: dict[str, Any],
+    today_md: tuple[int, int] | None = None,
+    extra_filters: list[dict[str, Any]] | None = None,
+) -> None:
+    """给每个候选打 violates 标签（命中且【当日生效】的偏好原文）。只标注，不删货。
+    extra_filters: planner 每日输出的查漏规避(与 order_filters 同构)——编译器未覆盖的
+    偏好由每日 LLM 补成当日生效的过滤条件(只规避不强制,错杀有界)。"""
+    filters = list((ir or {}).get("order_filters") or []) + list(extra_filters or [])
     for c in candidates:
         c["violates"] = [
             (f.get("raw_text") or f.get("field"))
