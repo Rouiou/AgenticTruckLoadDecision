@@ -1,874 +1,1213 @@
-"""决策入口（瘦编排层）：状态 → 记忆 → 查货 → 偏好无关预筛 → 提示 → 模型 → 护栏 → 动作。
+"""Budgeted DriverOps-MultiAgent Council decision service.
 
-保持 `SimulationApiPort` 契约不变。设计原则（见 task_plan.md「G. 合规边界」）：
-- 代码只做【客观计算 + 护栏】；
-- 一切【偏好理解与取舍】交给 LLM；
-- decide() 任何异常都兜底为安全动作，绝不让司机因报错出局归零。
+LLM owns strategy, preference interpretation, debate, and final decisions. The
+code only calls allowed environment APIs, computes factual metrics, filters hard
+illegal orders, and validates the final action shape.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
 
 from simkit.ports import SimulationApiPort
 
-from . import checker, compiler, guardrails, llm, planner, prompts, tools
-from .memory import DriverMemory
+_SIMULATION_EPOCH = datetime(2026, 3, 1, 0, 0, 0)
+_WALL_FMT = "%Y-%m-%d %H:%M:%S"
+_DEFAULT_SPEED_KMPH = 60.0
+_DEFAULT_COST_PER_KM = 1.5
+_HORIZON_MINUTES = 92 * 24 * 60
+_TOKEN_SOFT_LIMIT = 4_600_000
+_MAX_WAIT_MINUTES = _HORIZON_MINUTES
+
+# ===== K底Z甲 feature flags(形状参数,零偏好常量;全部默认=v19原行为,逐项验证后开启) =====
+FEATURE_FLAGS = {
+    "compile_temperature0": False,   # Day1: 编译temperature=0+单次重试
+    "rest_window_strict": False,     # Day1: 删默认兜底,五条件验证不满足→unknown
+    "compile_audit": False,          # Day1: 编译后本地audit九项+冲突剥离+family去重
+    "field_voting": False,           # Day1: 字段级3票(period/数量5票),不一致→降级unknown
+    "dynamic_longhaul": False,       # Day1: ledger存transport_min列表,按limit阈值现算
+    "snap_vocab": False,             # Day1: 品类等值snap词表(三处匹配点)
+    "council_v2": False,             # Day2: guardian→Council(top10对齐/±800限幅/must_wait/need_scout)
+    "monthend_scout": False,         # Day3: 月末安全广查闸门
+    "subgrad_shadow": False,         # Day3: 次梯度影子价格(关=0.12常数)
+    "ltd_reposition": False,         # Day4: 受限reposition(三重闸门)
+    "dest_value": False,             # Day4: V落点价值表
+}
 
 
-def _parse_md(s: Any) -> tuple[int, int] | None:
-    """'M-D' 或 'MM-DD' → (月, 日)。"""
-    try:
-        parts = str(s).strip().split("-")
-        if len(parts) >= 2:
-            return int(parts[-2]), int(parts[-1])
-    except (TypeError, ValueError):
-        pass
-    return None
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    radius_km = 6371.0
+    p1, l1 = math.radians(lat1), math.radians(lng1)
+    p2, l2 = math.radians(lat2), math.radians(lng2)
+    dp, dl = p2 - p1, l2 - l1
+    h = math.sin(dp * 0.5) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl * 0.5) ** 2
+    return 2.0 * radius_km * math.asin(math.sqrt(max(0.0, min(1.0, h))))
 
 
-def _now_md(now_wall: str) -> tuple[int, int] | None:
-    """'YYYY-MM-DD HH:MM:SS' → (月, 日)。"""
-    try:
-        d = now_wall.split()[0].split("-")
-        return int(d[1]), int(d[2])
-    except (IndexError, ValueError):
+def _distance_minutes(distance_km: float, speed_kmph: float = _DEFAULT_SPEED_KMPH) -> int:
+    if distance_km <= 0:
+        return 1
+    return max(1, math.ceil(distance_km / speed_kmph * 60.0))
+
+
+def _parse_wall_minutes(value: str | None) -> int | None:
+    if not value:
         return None
+    try:
+        dt = datetime.strptime(str(value).strip(), _WALL_FMT)
+    except ValueError:
+        return None
+    return int((dt - _SIMULATION_EPOCH).total_seconds() // 60)
 
 
-# ===== R1 确定性执行 feature flags（形状参数，零偏好常量）=====
-# B版终态: "llm"=LLM选单掌舵(带台账prompt,守住每日量/间隔等需要台账的偏好——官方实证
-# argmax/hybrid 在隐藏司机上扣分364k vs llm线137.5k,差距=LLM用台账做的隐式履约)
-# + 确定性运营增强(候选按有效时薪排序/影子价格surface/R2广查/等值/全部修复)
-DECIDE_MODE = "llm"  # "argmax"=确定性选单 / "hybrid"=argmax提名+LLM单票否决 / "llm"=LLM选单掌舵
-SHADOW_LOG = False      # True=行为走旧llm路径,同时记录argmax提名(本地分歧率统计用,提交包必须False)
-REQUERY_MIN = 60        # 无正分候选时的再查间隔(分钟)
-SHADOW_CAP = 5000.0     # 配额影子价格封顶(元/单)
-SAFE_BQ = True          # R2 月末安全广查(低频/不压线/时钟刷新/等值,广查结果并入打分不强制接)
-SAFE_BQ_DAYS = 3        # 月末窗口:days_left ≤ remaining + 此值 才广查
+def _wall_text(sim_minutes: int) -> str:
+    return (_SIMULATION_EPOCH + timedelta(minutes=int(sim_minutes))).strftime(_WALL_FMT)
+
+
+def _month_key(sim_minutes: int) -> str:
+    return (_SIMULATION_EPOCH + timedelta(minutes=int(sim_minutes))).strftime("%Y-%m")
+
+
+def _weekday_text(sim_minutes: int) -> str:
+    return (_SIMULATION_EPOCH + timedelta(minutes=int(sim_minutes))).strftime("%A")
+
+
+def _covered_clock_hours(start_min: int, end_min: int) -> list[int]:
+    if end_min <= start_min:
+        return []
+    hours: set[int] = set()
+    cursor = start_min
+    while cursor < end_min:
+        hours.add((cursor // 60) % 24)
+        cursor = ((cursor // 60) + 1) * 60
+    return sorted(hours)
+
+
+def _interval_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+    return max(a_start, b_start) < min(a_end, b_end)
+
+
+def _cargo_point(cargo: dict[str, Any], key: str) -> tuple[float, float]:
+    point = cargo.get(key) or {}
+    return float(point["lat"]), float(point["lng"])
+
+
+def _cargo_price_yuan(cargo: dict[str, Any]) -> float:
+    price = float(cargo.get("price", 0.0) or 0.0)
+    # query_cargo in the provided simulator already normalizes raw cents to yuan.
+    # Keep a guard for unnormalized API payloads without dividing normal yuan prices twice.
+    return price / 100.0 if price > 10000 else price
+
+
+def _optional_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass
+class CandidateFact:
+    cargo_id: str
+    cargo: dict[str, Any]
+    source: str
+    query_km: float
+    pickup_km: float
+    haul_km: float
+    pickup_min: int
+    wait_min: int
+    transport_min: int
+    finish_min: int
+    price_yuan: float
+    cost_yuan: float
+    net_yuan_before_pref: float
+    net_per_hour_before_pref: float
+    near_end_cargo_seen: int
+    legal: bool
+    veto_reasons: list[str] = field(default_factory=list)
 
 
 class ModelDecisionService:
-    def __init__(self, api: SimulationApiPort) -> None:
+    """Batched multi-agent council.
+
+    One LLM call per normal step:
+    1. Full Multi-Agent Council: State Observer + Commander + Scout + Cargo Analysts
+       + Preference + Risk + Future + Critic + Arbiter
+
+    In budget guard mode, candidate count shrinks, but the LLM still makes the
+    final decision. Invalid LLM actions fail fast instead of being replaced by a
+    deterministic backup action.
+    """
+
+    ENABLE_THINKING: bool = False
+
+    def __init__(self, api: SimulationApiPort, *, enable_thinking: bool | None = None) -> None:
         self._api = api
-        self._memory = DriverMemory()
-        self._compiler = compiler.PreferenceCompiler()
+        self._enable_thinking = self.ENABLE_THINKING if enable_thinking is None else enable_thinking
         self._logger = logging.getLogger("agent.decision_service")
-        self._last_bq: dict[tuple[str, str], int] = {}  # (司机,品类)→上次广查的仿真天，用于每天最多广查一次
+        self._observed_points_by_driver: dict[str, list[dict[str, float]]] = {}
+        self._chosen_orders_by_driver: dict[str, list[dict[str, Any]]] = {}
+        self._preference_policy_by_driver: dict[str, dict[str, Any]] = {}
+        self._target_memory_by_driver: dict[str, list[dict[str, Any]]] = {}
 
     def decide(self, driver_id: str) -> dict[str, Any]:
-        try:
-            return self._decide(driver_id)
-        except Exception as e:  # 决策绝不能抛——抛了该司机整月归零
-            self._logger.exception("decide 异常，兜底 wait: %s", e)
-            return guardrails.fallback_action()
+        status = self._api.get_driver_status(driver_id)
+        all_history = self._api.query_decision_history(driver_id, -1)
+        records = all_history.get("records") if isinstance(all_history.get("records"), list) else []
+        recent = records[-8:]
+        cumulative_tokens = self._history_tokens(records)
+        budget_guard = cumulative_tokens >= _TOKEN_SOFT_LIMIT
+        pref_policy = self._compiled_preference_policy(status, recent)
 
-    def _decide(self, driver_id: str) -> dict[str, Any]:
-        api = self._api
-        status = api.get_driver_status(driver_id)
-        now_min = int(status.get("simulation_progress_minutes") or 0)
-        now_wall = str(status.get("simulation_wall_time") or "")
-        month_end_min, month_end_wall = tools.month_end(now_wall)
-
-        self._memory.observe(driver_id, status, api)
-        mem_summary = self._memory.summary_text(driver_id, status)
-
-        # 编译偏好为通用约束（LLM 理解，按原文哈希缓存；代码零偏好常量）
-        ir = self._compiler.compile(api, status.get("preferences") or [])
-
-        # 日度规划：整月/日期类义务仍由 LLM（低频）
-        day = now_min // 1440
-        if self._memory.planned_day(driver_id) != day:
-            directive = planner.plan_day(api, status, mem_summary, now_wall, month_end_wall)
-            self._memory.set_directive(driver_id, day, directive)
-        directive = self._memory.get_directive(driver_id)
-
-        # 整休配额刹车：只有"剩余天数已不够凑够配额"时才允许整休；否则今天交回去干活(治"过度整休"漏接货)。
-        # 纯天数算术(配额 N 来自 LLM 读偏好；剩余/已休来自客观计数)，零偏好常量。
-        try:
-            req = int(ir.get("off_days_required") or directive.get("off_days_required") or 0)
-            if req > 0:
-                cur_day = now_min // 1440
-                taken = self._memory.off_days_taken(driver_id, cur_day)
-                remaining = max(0, req - taken)
-                days_left = max(1, (month_end_min // 1440) - cur_day)
-                _cmd = _now_md(now_wall)
-                _has_dated_today = any(
-                    _parse_md(t.get("date", "")) == _cmd for t in (directive.get("dated_tasks") or [])
-                )
-                _restricted = checker.has_dated_restriction_today(ir, _cmd)
-                if _has_dated_today:
-                    eff_off = False  # 当日有专属日程(如赴约/办事)→ 不整休，交义务执行/LLM
-                elif _restricted:
-                    eff_off = True  # 日期条件区域限制日(如某地查车)→ 当天保持静止最安全，且正好计入整休配额
-                elif remaining <= 0:
-                    eff_off = False
-                elif remaining >= days_left:
-                    eff_off = True  # 无余量，必须整休
-                elif directive.get("today_is_off_day") and days_left <= remaining + 2:
-                    eff_off = True  # 临近末尾，听 planner 安排整休
-                else:
-                    eff_off = False  # 有余量 → 今天去干活，别白白整休
-                if eff_off != bool(directive.get("today_is_off_day")):
-                    directive = dict(directive)
-                    directive["today_is_off_day"] = eff_off
-        except Exception as e:
-            self._logger.warning("off-day 刹车失败: %s", e)
-
-        # —— 整休日集合：把"还差的整休天数"定在月末最后几天，确定性执行(全天静止 + 防长途溢出) ——
-        off_set: set[int] = set()
-        try:
-            _req = int(ir.get("off_days_required") or directive.get("off_days_required") or 0)
-            if _req > 0:
-                _cur = now_min // 1440
-                _rem = max(0, _req - self._memory.off_days_taken(driver_id, _cur))
-                _meday = month_end_min // 1440
-                if _rem > 0:
-                    off_set = set(range(max(_cur, _meday - _rem), _meday))
-        except Exception as e:
-            self._logger.warning("off_set 计算失败: %s", e)
-
-        # —— 确定性休息：当前若处于 LLM 编译出的休息时段，直接一次长 wait 睡到时段结束 ——
-        # 时段全部来自 LLM 对偏好原文的解析(compiler/planner)，代码只执行、不自定义时段；
-        # 并省去本步查货与模型调用开销。这是把"作息类硬约束"做成确定性可靠、从而转正的关键。
-        windows = checker.window_tuples(ir, directive)
-        inside, end_abs = checker.in_any_window(now_min, windows)
-        if inside and end_abs and end_abs > now_min:
-            dur = min(end_abs - now_min, guardrails.MAX_WAIT_MINUTES)
+        rest_wait = self._current_rest_wait_minutes(status, pref_policy)
+        if rest_wait is not None:
+            action = {"action": "wait", "params": {"duration_minutes": rest_wait}}
             self._logger.info(
-                "rest-window 确定性休息 driver=%s wait=%s 睡到 %s",
+                "deterministic rest decision driver=%s sim_min=%s tokens_so_far=%s action=%s",
                 driver_id,
-                dur,
-                tools.min_to_wall(end_abs),
+                status.get("simulation_progress_minutes"),
+                cumulative_tokens,
+                action,
             )
-            return {"action": "wait", "params": {"duration_minutes": dur}}
+            return action
 
-        # —— 整休日：全天不接单不空驶。确定性执行，不靠提示词。——
-        if (now_min // 1440) in off_set or directive.get("today_is_off_day"):
-            cur_day = now_min // 1440
-            dur = min(max(1, (cur_day + 1) * 1440 - now_min), guardrails.MAX_WAIT_MINUTES)
-            self._logger.info("off-day 整休 driver=%s wait=%s", driver_id, dur)
-            return {"action": "wait", "params": {"duration_minutes": dur}}
-
-        # —— 确定性义务执行：日期任务(到坐标停留) + 区域配额(临近期限去该地找货) ——
-        # 坐标/日期/地名全部来自 LLM 对偏好的编译(planner)，代码只在该去的日子可靠执行；休息优先(上面已返回)。
-        forced = self._obligation_action(driver_id, status, now_min, now_wall, month_end_min, directive)
-        if forced is not None:
-            return forced
-
-        lat = float(status["current_lat"])
-        lng = float(status["current_lng"])
-        resp = api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=60)
-        # 查货会推进仿真时钟(ceil(条数/10)分钟)，但 now_min 取自查货前 → 完成时刻估算系统性
-        # 乐观了几~几十分钟，压线接单会确定性溢入休息时段(本地法医:全部夜休违规均为此因)。
-        # get_driver_status 不耗仿真时间，刷新即修复。纯客观时钟同步，与偏好无关。
-        now_min = int(api.get_driver_status(driver_id).get("simulation_progress_minutes") or now_min)
-        items = resp.get("items", []) or []
-        # 累积真实品类名词表(客观事实,供配额关键词等值对齐——评分按完全相等计数)
-        self._memory.note_cargo_names(
-            driver_id, ((it.get("cargo") or {}).get("cargo_name") for it in items if isinstance(it, dict))
+        items = self._observe_current_market(driver_id, status, budget_guard)
+        status_after_query = self._api.get_driver_status(driver_id)
+        self._remember_observed_points(driver_id, items)
+        first_pass = self._build_candidate_facts(status_after_query, items, source="local")
+        expansion_plan = None
+        if self._should_expand_market(first_pass, budget_guard):
+            extra_items = self._run_deterministic_market_scout_queries(driver_id, status_after_query, first_pass, budget_guard)
+            if extra_items:
+                items.extend(extra_items)
+                status_after_query = self._api.get_driver_status(driver_id)
+                self._remember_observed_points(driver_id, extra_items)
+        else:
+            self._logger.info("market scout skipped: local portfolio is sufficiently broad")
+        all_candidates = self._build_candidate_facts(status_after_query, items, source="portfolio")
+        candidates = self._select_prompt_candidates(all_candidates, status_after_query, budget_guard)
+        self._logger.info(
+            "candidate_facts_json data=%s",
+            json.dumps([self._candidate_prompt(c) for c in candidates], ensure_ascii=False, separators=(",", ":")),
         )
-        active_cats = self._active_quota_categories(driver_id, ir, now_wall)
-        candidates = tools.prepare_candidates(
-            items, now_min, month_end_min, top_n=10, quota_categories=active_cats
-        )
-        # 按"当日生效"给候选打违规标签(只标注不删货)；planner 的每日查漏规避(avoid_filters)
-        # 先过【配额冲突护栏】：planner 可能把"必须接满某品类"误写成规避(实测连续20天误报、
-        # 错杀配额品类代价无界)——与任何配额品类相交的 cargo_name 规避条目一律剔除(确定性)。
-        safe_avoid = self._sanitize_avoid_filters(directive.get("avoid_filters"), ir, driver_id)
-        checker.annotate(candidates, ir, _now_md(now_wall), extra_filters=safe_avoid)
-        # 防溢出：会送达到"必须整休日"的单，提前标违规(否则前一天接的长途会占用整休日凌晨)
-        if off_set:
-            for c in candidates:
-                try:
-                    if (int(c.get("est_finish_min") or now_min) // 1440) in off_set:
-                        c.setdefault("violates", []).append("会送达到必须整休的整天")
-                except (TypeError, ValueError):
-                    pass
-        # 防错过日期任务：会送达到"有未完成专属日程的日子"的单，提前标违规(F6,
-        # 旧版靠选单LLM看提示词隐式规避,确定性选单必须显式化,否则机械爽约)
-        pending_days = self._pending_task_days(driver_id, directive, now_min)
-        if pending_days:
-            for c in candidates:
-                try:
-                    if (int(c.get("est_finish_min") or now_min) // 1440) in pending_days:
-                        c.setdefault("violates", []).append("会占用有专属日程的日子")
-                except (TypeError, ValueError):
-                    pass
-        # —— 月度单数上限(如 >8h 长途 ≤N/月)：本月已达上限 → 命中谓词的候选标违规(LLM/反闲置都不接) ——
-        self._mark_monthly_caps(driver_id, ir, now_wall, candidates)
-        for c in candidates:
-            self._memory.note_candidate(driver_id, c["cargo_id"], c)
-
-        # —— 品类配额履约：llm 模式走旧"顺路履约"强制路径；argmax/hybrid 模式由
-        # 影子价格统一接管(配额货加边际罚款分后与普通货同台竞争,经济权衡自动完成) ——
-        if DECIDE_MODE == "llm" or SHADOW_LOG:
-            forced_q = self._quota_action(
-                driver_id, status, ir, now_min, now_wall, month_end_min, candidates, windows, off_set
+        if self._unknown_constraints(pref_policy) and candidates:
+            guardian = self._preference_guardian_council(
+                status_after_query,
+                recent,
+                candidates,
+                cumulative_tokens,
+                pref_policy,
             )
-            if forced_q is not None:
-                return forced_q
-
-        # ========== R1 确定性选单 ==========
-        # 打分=有效时薪+配额影子价格(tools.score_candidate)；硬过滤=violates(含IR过滤/整休/
-        # 日期任务/月上限标注)+不跨休息窗(60缓冲)。argmax 替代每步 LLM 选单：
-        # 消除±20k选单方差、省token、时薪目标函数治"绝对额排序看不见等窗时间"。
-        shadow_map = self._build_shadow_map(driver_id, ir, now_wall, month_end_min, now_min)
-        # 月度数量【下限】(如"每月长途至少N单")：落后且来不及 → 给满足谓词的候选加边际罚款分
-        # (与品类配额影子价格同构;时薪排序天然偏短单,无此机制下限型偏好会被机械欠交)
-        self._apply_floor_bonus(driver_id, ir, now_wall, month_end_min, now_min, candidates)
-        # —— R2 安全配额回补：月末告急且本地无该品类干净货 → 低频广查把配额货并入候选打分。
-        # 与旧广查的全部区别：月末窗口/不压线(60缓冲)/时钟刷新/等值匹配/距夜休远才查/每天每品类一次/
-        # 不强制接(影子价格让它自然胜出)。每次~60min查询税换数千罚款,经济上压倒性合算。
-        if SAFE_BQ and shadow_map:
-            extra, now_min = self._safe_broad_query(
-                driver_id, status, ir, now_min, now_wall, month_end_min, shadow_map, windows, candidates,
-                safe_avoid,
-            )
-            if extra:
-                candidates = candidates + extra
-        clean = [
-            c
-            for c in candidates
-            if not c.get("violates")
-            and not checker.overlaps_any_window(now_min, int(c.get("est_finish_min") or now_min), windows)
-        ]
-        scored = sorted(
-            ((tools.score_candidate(c, now_min, shadow_map), c) for c in clean),
-            key=lambda x: x[0],
-            reverse=True,
-        )
-        positive = [(s, c) for s, c in scored if s > 0]
-        if SHADOW_LOG:
-            top = positive[0] if positive else None
-            self._logger.info(
-                "shadow argmax driver=%s 提名=%s score=%.2f shadow_cats=%s",
-                driver_id,
-                top[1]["cargo_id"] if top else "wait",
-                top[0] if top else 0.0,
-                list(shadow_map),
-            )
-        if DECIDE_MODE in ("argmax", "hybrid") and not SHADOW_LOG:
-            if positive:
-                pick = None
-                if DECIDE_MODE == "hybrid":
-                    # LLM 单票否决(权限棘轮:只能说"不",不能换单)；至多问前2名,全否则等待
-                    prefs_text = [str(p.get("content") or "") for p in (status.get("preferences") or [])]
-                    for s, c in positive[:2]:
-                        if not self._llm_veto(api, c, prefs_text):
-                            pick = (s, c)
-                            break
-                else:
-                    pick = positive[0]
-                if pick is not None:
-                    s, c = pick
-                    self._logger.info(
-                        "decide driver=%s t=%s cand=%s -> argmax take %s rate=%.2f shadow=%s",
-                        driver_id, now_min, len(candidates), c["cargo_id"], s,
-                        str(c.get("cargo_name") or "") in shadow_map,
-                    )
-                    return {"action": "take_order", "params": {"cargo_id": c["cargo_id"]}}
-            act = self._wait_action(now_min, windows)
-            self._logger.info(
-                "decide driver=%s t=%s cand=%s -> argmax wait %s", driver_id, now_min, len(candidates), act["params"]
-            )
-            return act
-        # ========== 旧 LLM 选单路径(DECIDE_MODE=="llm" 或 SHADOW_LOG 影子对照) ==========
-
-        region_hint = ""
-        rt = directive.get("region_target") if isinstance(directive, dict) else None
-        if isinstance(rt, dict) and rt.get("need_days", 0) > 0:
-            _done = self._memory.region_days_done(driver_id, rt["keyword"])
-            if len(_done) < rt["need_days"]:
-                region_hint = (
-                    f"仍需在「{rt['keyword']}」接单(起或终点城市含该地名)共 {rt['need_days']} 个不同日，"
-                    f"已完成 {len(_done)} 日；附近若有起/终点含「{rt['keyword']}」的候选请【优先接】。"
-                )
-        quota_hint = ""
-        try:
-            _cm = _now_md(now_wall)
-            if _cm:
-                _parts = []
-                for q in ir.get("category_quotas") or []:
-                    if int(q.get("month") or 0) != _cm[0]:
-                        continue
-                    _cat = str(q.get("category") or "").strip()
-                    _need = int(q.get("min_orders") or 0)
-                    _done = self._memory.category_orders_done(driver_id, _cat, _cm[0])
-                    if _cat and _need - _done > 0:
-                        _parts.append(f"本月还需接「{_cat}」{_need - _done} 单(已 {_done}/{_need})")
-                if _parts:
-                    quota_hint = "；".join(_parts) + "；附近若有该品类干净候选请【优先接】(省大额罚款)。"
-        except Exception:
-            quota_hint = ""
-
-        cap_hint = ""
-        try:
-            _cm2 = _now_md(now_wall)
-            if _cm2:
-                _cparts = []
-                for cap in ir.get("monthly_count_caps") or []:
-                    field = str(cap.get("field") or "").strip()
-                    thr = cap.get("threshold")
-                    maxm = cap.get("max_per_month")
-                    if not field or thr is None or maxm is None:
-                        continue
-                    done = self._memory.monthly_predicate_count(driver_id, field, float(thr), _cm2[0])
-                    rem = int(maxm) - done
-                    _cparts.append(
-                        f"本月此类单已接{done}/{int(maxm)}，"
-                        + ("已满→别再接(violates 已标)" if rem <= 0 else f"还可接{rem}单，超了每单扣钱")
-                    )
-                if _cparts:
-                    cap_hint = "；".join(_cparts)
-        except Exception:
-            cap_hint = ""
-
-        compliance = {
-            "今日休息块(到点会被自动安排休息)": directive.get("rest_block_today"),
-            "区域配额": region_hint,
-            "品类配额(本月必须接满某品类单数)": quota_hint,
-            "月度单数上限(超就扣钱)": cap_hint,
-            "已识别硬约束原文": [f.get("raw_text") for f in ir.get("order_filters", [])]
-            + [w.get("raw_text") for w in ir.get("rest_windows", [])],
-            "提示": "候选 violates 非空=别接；接单前看预计完成时刻，别接会跨进休息块的单(否则会被否决)",
-        }
-        cand_by_id = {c["cargo_id"]: c for c in candidates}
-        cand_ids = set(cand_by_id)
-
-        messages = prompts.build_messages(
-            status, candidates, mem_summary, now_wall, month_end_wall, directive, compliance
-        )
-
-        # 决策 + 确定性否决重试（最多 3 次尝试）：代码不替偏好做选择，只否决违规并退回 LLM
-        action = None
-        for _ in range(3):
-            obj = llm.chat_json(api, messages)
-            cand = guardrails.parse_and_validate(obj, cand_ids) if obj is not None else None
-            if cand is None:
-                break
-            reason = checker.veto(cand, cand_by_id, windows, now_min)
-            if reason is None:
-                action = cand
-                break
-            messages.append({"role": "assistant", "content": json.dumps(cand, ensure_ascii=False)})
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"上个动作被否决：{reason}。请改选不违反偏好的动作"
-                        f"（violates 非空的候选别接；若在休息时段，请用一次长 wait 睡到 "
-                        f"{compliance.get('建议一次长wait睡到(墙钟)') or '休息时段结束'}）。只输出 JSON。"
-                    ),
-                }
-            )
-
-        # 休息时段：确定性保证"一次长 wait 覆盖到块结束"。评分要求【连续】休息，
-        # 多次短 wait 会被中间的 query 扫描分钟切碎、永远凑不满，故在窗内强制单次长 wait。
-        # （休息时段与时长均来自 LLM 编译的偏好；代码只负责可靠执行，不决定是否/何时休息。）
-        if inside and end_abs and end_abs > now_min:
-            needed = min(end_abs - now_min, guardrails.MAX_WAIT_MINUTES)
-            cur_wait = (
-                int(action["params"].get("duration_minutes", 0))
-                if action and action.get("action") == "wait"
-                else 0
-            )
-            if cur_wait < needed:
-                action = {"action": "wait", "params": {"duration_minutes": needed}}
-
-        # 反闲置：LLM 想干等，但本地有【不违规 + 正利润 + 不跨休息块】的可接货 → 改接最赚的(别白等一天)。
-        # 纯经济优化(偏好已由 violates/veto 过滤、ROI 正即真赚钱)；整休日不触发；不含任何偏好常量。
-        _special = str(directive.get("today_special_task") or "").strip()
-        _has_special = _special and _special != "无"
-        if (
-            action
-            and action.get("action") == "wait"
-            and not directive.get("today_is_off_day")
-            and not _has_special  # 当日有专属日程 → 让位给 LLM/义务执行，别瞎接单错过日程
-            and not checker.has_dated_restriction_today(ir, _now_md(now_wall))  # 日期条件规避日 → 让位给 LLM 整体规避
-        ):
-            takeable = [
-                c
-                for c in candidates
-                if not c.get("violates")
-                and float(c.get("roi_score") or 0) > 0
-                and not checker.overlaps_any_window(now_min, int(c.get("est_finish_min") or now_min), windows)
-            ]
-            if takeable:
-                # 按有效时薪+影子价格选(替代绝对额roi——序贯调度正确排序键)
-                best = max(takeable, key=lambda c: tools.score_candidate(c, now_min, shadow_map))
-                self._logger.info(
-                    "anti-idle 改接 driver=%s %s rate=%.2f",
-                    driver_id, best["cargo_id"], tools.score_candidate(best, now_min, shadow_map),
-                )
-                action = {"action": "take_order", "params": {"cargo_id": best["cargo_id"]}}
-
-        if action is None:
-            action = guardrails.fallback_action()
-            self._logger.warning("LLM 多次违规/无效，确定性兜底 wait: driver=%s", driver_id)
+            all_candidates = self._guardian_downgrade_candidates(all_candidates, guardian)
+        action = self._deterministic_execution_decision(driver_id, status_after_query, all_candidates, pref_policy)
+        self._remember_chosen_action(driver_id, action, all_candidates)
 
         self._logger.info(
-            "decide driver=%s t=%s cand=%s -> %s %s",
+            "deterministic decision driver=%s sim_min=%s tokens_so_far=%s items=%s candidates=%s action=%s params=%s",
             driver_id,
-            now_min,
-            len(candidates),
+            status_after_query.get("simulation_progress_minutes"),
+            cumulative_tokens,
+            len(items),
+            len(all_candidates),
             action.get("action"),
             action.get("params"),
         )
         return action
 
-    def _build_shadow_map(
-        self, driver_id: str, ir: dict[str, Any], now_wall: str, month_end_min: int, now_min: int
-    ) -> dict[str, float]:
-        """配额影子价格表 {真实品类名: 边际罚款}。只给【落后且按配速来不及】的配额加价——
-        来得及的配额货按自然时薪竞争(顺路凑,零额外成本)。品类名经等值对齐(评分按完全相等计数)；
-        无法对齐(unmapped)不强制履约。全部数值来自 LLM 编译 IR + 客观计数,零偏好常量。绝不抛异常。"""
-        out: dict[str, float] = {}
-        try:
-            cmd = _now_md(now_wall)
-            if not cmd:
-                return out
-            cur_month = cmd[0]
-            days_passed = max(0, int(cmd[1]) - 1)
-            days_left = max(0, (month_end_min - now_min) // 1440)
-            known = self._memory.cargo_names(driver_id)
-            for q in ir.get("category_quotas") or []:
-                if int(q.get("month") or 0) != cur_month:
-                    continue
-                cat = str(q.get("category") or "").strip()
-                need = int(q.get("min_orders") or 0)
-                if not cat or need <= 0:
-                    continue
-                done = self._memory.category_orders_done(driver_id, cat, cur_month)
-                remaining = need - done
-                if remaining <= 0:
-                    continue
-                projected = (done / max(1, days_passed)) * days_left
-                if projected >= remaining and days_left > remaining + 2:
-                    continue  # 按当前节奏来得及 → 不加价,顺路自然竞争
-                snapped, st = tools.snap_category(cat, known)
-                if st == "unmapped":
-                    continue  # 无法对齐到真实品类名 → 不强制(原文仍在偏好提示里)
-                ppu = float(q.get("penalty_per_unit") or 0.0)
-                out[snapped] = min(ppu if ppu > 0 else SHADOW_CAP, SHADOW_CAP)
-        except Exception as e:
-            self._logger.warning("shadow_map 构造失败: %s", e)
-        return out
-
-    def _sanitize_avoid_filters(
-        self, avoid: Any, ir: dict[str, Any], driver_id: str
-    ) -> list[dict[str, Any]]:
-        """avoid_filters 配额冲突护栏：配额品类是【必做】项，planner 误把它写成规避会
-        全天封杀该品类(履约/广查/LLM三路全灭)——任何 value 与配额品类(等值对齐后)相互
-        包含的 cargo_name 规避条目，一律剔除并告警。纯文本比较，零偏好常量。"""
-        out: list[dict[str, Any]] = []
-        try:
-            known = self._memory.cargo_names(driver_id)
-            qcats: set[str] = set()
-            for q in ir.get("category_quotas") or []:
-                cat = str(q.get("category") or "").strip()
-                if cat:
-                    qcats.add(cat)
-                    snapped, _st = tools.snap_category(cat, known)
-                    qcats.add(snapped)
-            for f in avoid or []:
-                if not isinstance(f, dict):
-                    continue
-                if str(f.get("field") or "") == "cargo_name":
-                    vals = f.get("value")
-                    vals = vals if isinstance(vals, list) else [vals]
-                    hit = any(
-                        v and q and (str(v) in q or q in str(v)) for v in vals for q in qcats
-                    )
-                    if hit:
-                        self._logger.warning("avoid_filters 与配额品类冲突,剔除: %s", f)
-                        continue
-                out.append(f)
-        except Exception as e:
-            self._logger.warning("sanitize_avoid_filters 失败,保守置空: %s", e)
-            return []
-        return out
-
-    def _apply_floor_bonus(
-        self,
-        driver_id: str,
-        ir: dict[str, Any],
-        now_wall: str,
-        month_end_min: int,
-        now_min: int,
-        candidates: list[dict[str, Any]],
-    ) -> None:
-        """月度数量下限(min_per_month)的影子价格：本月该类单落后且配速来不及 →
-        给满足谓词(field>threshold)的候选加 _pred_bonus=边际罚款。绝不抛异常。"""
-        try:
-            cmd = _now_md(now_wall)
-            if not cmd:
-                return
-            cur_month, day_of_month = cmd[0], cmd[1]
-            days_passed = max(0, int(day_of_month) - 1)
-            days_left = max(0, (month_end_min - now_min) // 1440)
-            for cap in ir.get("monthly_count_caps") or []:
-                minm = cap.get("min_per_month")
-                field = str(cap.get("field") or "").strip()
-                thr = cap.get("threshold")
-                if minm is None or not field or thr is None:
-                    continue
-                done = self._memory.monthly_predicate_count(driver_id, field, float(thr), cur_month)
-                remaining = int(minm) - done
-                if remaining <= 0:
-                    continue
-                projected = (done / max(1, days_passed)) * days_left
-                if projected >= remaining and days_left > remaining + 2:
-                    continue  # 来得及 → 不加价
-                ppu = float(cap.get("penalty_per_unit") or 0.0) or SHADOW_CAP
-                bonus = min(ppu, SHADOW_CAP)
-                for c in candidates:
-                    try:
-                        if float(c.get(field) or 0) > float(thr):
-                            c["_pred_bonus"] = max(float(c.get("_pred_bonus") or 0.0), bonus)
-                    except (TypeError, ValueError):
-                        pass
-        except Exception as e:
-            self._logger.warning("floor_bonus 失败: %s", e)
-
-    def _safe_broad_query(
-        self,
-        driver_id: str,
-        status: dict[str, Any],
-        ir: dict[str, Any],
-        now_min: int,
-        now_wall: str,
-        month_end_min: int,
-        shadow_map: dict[str, float],
-        windows: list[Any],
-        candidates: list[dict[str, Any]],
-        avoid_filters: list[dict[str, Any]] | None = None,
-    ) -> tuple[list[dict[str, Any]], int]:
-        """R2 月末安全广查：返回(可并入打分的配额货候选, 刷新后的now_min)。
-        触发条件全部满足才查：①该配额月末告急(days_left≤remaining+SAFE_BQ_DAYS)
-        ②本地候选无该品类干净货 ③距下一休息窗 ≥ 本月单均占用时长(傍晚熔断)
-        ④今天该品类没查过。广查后刷新时钟；结果只并入候选(影子价格自然胜出)，不强制接。绝不抛异常。"""
-        try:
-            cmd = _now_md(now_wall)
-            if not cmd:
-                return [], now_min
-            cur_month, day_of_month = cmd[0], cmd[1]
-            days_left = max(0, (month_end_min - now_min) // 1440)
-            cur_day = now_min // 1440
-            known = self._memory.cargo_names(driver_id)
-            # 傍晚熔断：距下一休息窗的分钟数 < 典型单周期(本月完单均占用,无样本则240) → 不查
-            day0 = cur_day * 1440
-            tod = now_min - day0
-            nxt_win = min(
-                (day0 + (s if s > tod else s + 1440) for s, e in windows or []),
-                default=now_min + 100000,
-            )
-            typical = 240
-            if nxt_win - now_min < typical + 60:
-                return [], now_min
-            local_names = {str(c.get("cargo_name") or "") for c in candidates if not c.get("violates")}
-            for q in ir.get("category_quotas") or []:
-                if int(q.get("month") or 0) != cur_month:
-                    continue
-                cat = str(q.get("category") or "").strip()
-                snapped, st = tools.snap_category(cat, known)
-                if st == "unmapped" or snapped not in shadow_map:
-                    continue  # 没告急(影子未激活)或对不齐的不广查
-                need = int(q.get("min_orders") or 0)
-                remaining = need - self._memory.category_orders_done(driver_id, cat, cur_month)
-                if remaining <= 0 or days_left > remaining + SAFE_BQ_DAYS:
-                    continue  # 只在月末窗口动用大查询
-                if snapped in local_names:
-                    continue  # 本地已有该品类干净货,argmax 自己会选
-                bqkey = (driver_id, cat)
-                if self._last_bq.get(bqkey) == cur_day:
-                    continue  # 每天每品类最多一次
-                self._last_bq[bqkey] = cur_day
-                lat = float(status["current_lat"])
-                lng = float(status["current_lng"])
-                resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
-                # 广查推进时钟(最多60min)——立刻刷新,防完成时刻估算乐观导致压线溢入夜休
-                now_min = int(
-                    self._api.get_driver_status(driver_id).get("simulation_progress_minutes") or now_min
-                )
-                wide = tools.prepare_candidates(
-                    resp.get("items", []) or [], now_min, month_end_min, top_n=600, quota_categories=[cat]
-                )
-                checker.annotate(wide, ir, cmd, extra_filters=avoid_filters)
-                extra = [
-                    c
-                    for c in wide
-                    if str(c.get("cargo_name") or "") == snapped
-                    and not c.get("violates")
-                    and not checker.overlaps_any_window(now_min, int(c.get("est_finish_min") or now_min), windows)
-                ][:8]
-                for c in extra:
-                    self._memory.note_candidate(driver_id, c["cargo_id"], c)
-                self._logger.info(
-                    "R2 安全广查 driver=%s 品类=%s 还差=%s days_left=%s 找到干净货=%s",
-                    driver_id, cat, remaining, days_left, len(extra),
-                )
-                return extra, now_min  # 每步最多广查一个品类(控制时间税)
-            return [], now_min
-        except Exception as e:
-            self._logger.warning("安全广查失败: %s", e)
-            return [], now_min
-
-    def _wait_action(self, now_min: int, windows: list[Any]) -> dict[str, Any]:
-        """无正分候选时的确定性等待：睡到 min(下一休息窗开始, 当天结束, 再查间隔)。
-        纯时间算术；休息窗来自 LLM 编译。"""
-        day = now_min // 1440
-        tod = now_min - day * 1440
-        cands = [now_min + REQUERY_MIN, (day + 1) * 1440]
-        for s, e in windows or []:
-            cands.append(day * 1440 + (s if s > tod else s + 1440))
-        until = min(cands)
-        dur = max(1, min(until - now_min, guardrails.MAX_WAIT_MINUTES))
-        return {"action": "wait", "params": {"duration_minutes": dur}}
-
-    def _llm_veto(self, api: Any, c: dict[str, Any], prefs_text: list[str]) -> bool:
-        """hybrid 模式的单票否决：LLM 通读全部偏好原文,只回答"接这单是否违反任何偏好"。
-        权限棘轮——LLM 只能否决,不能改选其他单。失败(None)按不否决处理(下界=argmax)。"""
-        try:
-            q = {
-                "候选": {
-                    "品类": c.get("cargo_name"),
-                    "起点": (c.get("start") or {}).get("city"),
-                    "终点": (c.get("end") or {}).get("city"),
-                    "赴装空驶km": c.get("deadhead_km"),
-                    "干线分钟": c.get("cost_time_minutes"),
-                    "预计完成时刻": c.get("预计完成时刻"),
+    def _compiled_preference_policy(self, status: dict[str, Any], recent: list[dict[str, Any]]) -> dict[str, Any]:
+        driver_id = str(status.get("driver_id", ""))
+        prefs = status.get("preferences") or []
+        signature = json.dumps(prefs, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        cached = self._preference_policy_by_driver.get(driver_id)
+        if cached and cached.get("_signature") == signature:
+            return cached
+        policy = self._agent_json(
+            "Preference_Compiler_Agent",
+            (
+                "你是一次性 Preference Multi-Agent Compiler。请在同一次回答中完成三个子 Agent 的工作："
+                "1) Preference Parser Agent 抽取休息、限额、最低指标；"
+                "2) Target Continuity Auditor Agent 专门检查跨月欠额、补上月、延续指标、累计/重置口径；"
+                "3) Risk Compiler Agent 输出可执行 machine_ir。"
+                "最终只输出稳定、简短的经营 policy，供后续 Duty、Guardian、Arbiter 多 Agent 共用。"
+                "不要做最终动作，不要评价具体货源。"
+                "必须泛化到隐藏司机：只根据文本抽取约束，不要写死司机、月份、货类或公开集。"
+                "若文本有跨午夜时段，必须说明凌晨属于前一日夜间窗口；例如 23:00-06:00 中的周日00:30"
+                "属于周六23:00-周日06:00 这一夜。"
+                "若文本说晚两个小时再休息，表示休息开始时间顺延，结束时间不自动顺延。"
+                "强制自检：21:00-06:00 + 晚两个小时再休息 = 23:00-06:00；"
+                "不得输出 23:00-08:00，除非文本明确说晚两个小时起床、晚两个小时结束或休息结束顺延。"
+                "若有至少/最多/不得/必须/罚/扣/指标，输出它们的优先级和计数口径。"
+                "若文本提到“上月没完成、欠额、本月补、接着补”，必须结合 preference_ledger 和历史目标语义"
+                "判断欠额来自哪一个旧指标；如果当前文本没有明说旧货类，但历史 policy/ledger 能确定旧货类，"
+                "machine_ir.cargo_targets 必须额外输出本月补欠目标，并设置 makeup_from_previous=true。"
+                "若文本同时有“本月新指标”和“补旧欠额”，不要把旧欠额混入本月新指标的 min_count；"
+                "本月明说的货类目标只填明说数量，旧欠额应作为单独 cargo_target 输出或交给 target_memory 补齐。"
+                "若目标是按月考核，month 必须是计分归属月，min_count 必须是该 target 自身需要完成的数量。"
+                "输出必须包含 machine_ir，字段尽量用数字和枚举；后续代码执行层会直接读取它。"
+            ),
+            {
+                "state": self._state_summary(status),
+                "preferences_visible_now": prefs,
+                "preference_ledger": self._preference_ledger(driver_id),
+                "target_memory_from_previous_policies": self._target_memory_by_driver.get(driver_id, []),
+                "recent_actions": [self._compact_history(r) for r in recent[-4:]],
+                "output_schema": {
+                    "compiler_notes": {
+                        "preference_parser_agent": "brief",
+                        "target_continuity_auditor_agent": "brief",
+                        "risk_compiler_agent": "brief",
+                    },
+                    "policy_summary": "brief",
+                    "duty_windows": [
+                        {
+                            "label": "brief",
+                            "window": "clock/date text",
+                            "forbidden": ["take_order", "reposition", "other if text says so"],
+                            "overnight_note": "brief when crosses midnight",
+                        }
+                    ],
+                    "quota_limits": [
+                        {"scope": "month/date", "condition": "brief", "limit": "brief", "counting_basis": "brief"}
+                    ],
+                    "minimum_targets": [
+                        {"scope": "month/date", "condition": "brief", "target": "brief", "makeup_rule": "brief"}
+                    ],
+                    "soft_preferences": ["brief"],
+                    "critical_checks": ["short checklist for later agents"],
+                    "machine_ir": {
+                        "rest_windows": [
+                            {
+                                "label": "string",
+                                "days": "all|weekday|weekend",
+                                "start_hour": "0..23 integer",
+                                "end_hour": "0..23 integer",
+                                "forbid_take_order": "boolean",
+                                "forbid_reposition": "boolean",
+                            }
+                        ],
+                        "long_haul_limits": [
+                            {
+                                "scope": "monthly",
+                                "threshold_minutes": "integer",
+                                "max_count": "integer",
+                            }
+                        ],
+                        "cargo_targets": [
+                            {
+                                "month": "1..12 integer",
+                                "cargo_name": "string",
+                                "min_count": "integer",
+                                "penalty_amount": "number if visible preference has per-violation penalty",
+                                "makeup_from_previous": "boolean",
+                            }
+                        ],
+                        "cargo_max_limits": [
+                            {
+                                "month": "1..12 integer or null for all months",
+                                "cargo_name": "string",
+                                "max_count": "integer",
+                                "penalty_amount": "number if visible",
+                            }
+                        ],
+                        "region_avoid": [{"field": "origin|destination|either", "keyword": "city/province/region text"}],
+                        "origin_avoid": [{"keyword": "city/province/region text"}],
+                        "destination_prefer": [{"keyword": "city/province/region text", "bonus": "number or null"}],
+                        "region_min_targets": [],
+                        "date_or_weekday_rules": [],
+                        "makeup_targets": [],
+                        "soft_preferences": [],
+                        "unknown_constraints": [
+                            {
+                                "preference_text": "text not covered by executable IR",
+                                "why_unsupported": "brief",
+                                "risk_level": "low|medium|high",
+                            }
+                        ],
+                        "penalty_model": [],
+                    },
                 },
-                "司机偏好原文": prefs_text,
-                "问题": '只判断:接这一单是否会违反上述任一偏好?只输出 JSON {"veto":true/false,"reason":"一句话"}',
-            }
-            obj = llm.chat_json(
-                api, [{"role": "user", "content": json.dumps(q, ensure_ascii=False)}], max_tokens=120
+            },
+        )
+        policy = self._merge_preference_target_memory(driver_id, policy, prefs)
+        policy["_signature"] = signature
+        self._preference_policy_by_driver[driver_id] = policy
+        self._logger.info(
+            "compiled_preference_policy driver=%s data=%s",
+            driver_id,
+            json.dumps(policy, ensure_ascii=False, separators=(",", ":")),
+        )
+        return policy
+
+
+
+    def _deterministic_execution_decision(
+        self, driver_id: str, status: dict[str, Any], candidates: list[CandidateFact], pref_policy: dict[str, Any]
+    ) -> dict[str, Any]:
+        sim_min = int(status.get("simulation_progress_minutes", 0) or 0)
+        ledger = self._preference_ledger(driver_id)
+        scored: list[tuple[float, CandidateFact, list[str]]] = []
+        for cand in candidates:
+            if not cand.legal:
+                continue
+            vetoes = self._deterministic_vetoes(cand, pref_policy, ledger)
+            if vetoes:
+                continue
+            score = self._candidate_score(cand, pref_policy, ledger, sim_min)
+            scored.append((score, cand, []))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        if scored and scored[0][0] > 0:
+            best = scored[0][1]
+            self._logger.info(
+                "deterministic_score_choice cargo=%s score=%.2f facts=%s",
+                best.cargo_id,
+                scored[0][0],
+                json.dumps(self._candidate_prompt(best), ensure_ascii=False, separators=(",", ":")),
             )
-            return bool(obj and obj.get("veto"))
-        except Exception:
-            return False
+            return {"action": "take_order", "params": {"cargo_id": best.cargo_id}}
 
-    def _pending_task_days(self, driver_id: str, directive: dict[str, Any], now_min: int) -> set[int]:
-        """未完成日期任务所在的日序号集合(供候选标违规,防接单溢入专属日程日)。绝不抛异常。"""
-        out: set[int] = set()
-        try:
-            from datetime import datetime
+        wait = self._next_useful_wait_minutes(sim_min, pref_policy)
+        self._logger.info("deterministic_wait no_positive_candidate wait=%s seen=%s", wait, len(candidates))
+        return {"action": "wait", "params": {"duration_minutes": wait}}
 
-            today = now_min // 1440
-            for t in directive.get("dated_tasks") or []:
-                md = _parse_md(t.get("date", ""))
-                if not md:
-                    continue
-                try:
-                    d = (datetime(2026, md[0], md[1]) - tools.EPOCH).days
-                except ValueError:
-                    continue
-                if d < today:
-                    continue
-                key = "%s@%.4f,%.4f" % (t["date"], t["lat"], t["lng"])
-                if self._memory.is_dated_done(driver_id, key):
-                    continue
-                out.add(d)
-        except Exception as e:
-            self._logger.warning("pending_task_days 失败: %s", e)
-        return out
+    def _deterministic_vetoes(
+        self, cand: CandidateFact, pref_policy: dict[str, Any], ledger: dict[str, Any]
+    ) -> list[str]:
+        active_start = cand.finish_min - cand.pickup_min - cand.wait_min - cand.transport_min
+        vetoes: list[str] = []
+        if self._interval_overlaps_forbidden_window(active_start, cand.finish_min, pref_policy):
+            vetoes.append("rest_window_overlap")
+        for limit in self._long_haul_limits(pref_policy):
+            threshold = int(limit.get("threshold_minutes", 480) or 480)
+            max_count = int(limit.get("max_count", 999999) or 999999)
+            if cand.transport_min <= threshold:
+                continue
+            month = _month_key(cand.finish_min)
+            used = int((ledger.get("transport_duration_bins_by_month") or {}).get(month, {}).get("over_8h", 0) or 0)
+            if used >= max_count:
+                vetoes.append("long_haul_quota_full")
+        for limit in self._cargo_max_limits(pref_policy):
+            name = self._cargo_name(cand.cargo)
+            target_name = str(limit.get("cargo_name") or "").strip()
+            if not name or not target_name or name != target_name:
+                continue
+            max_count = _optional_int(limit.get("max_count"), 999999)
+            month_num = self._target_month(limit)
+            month = f"2026-{month_num:02d}" if month_num is not None else _month_key(cand.finish_min)
+            used = int((ledger.get("cargo_name_counts_by_month") or {}).get(month, {}).get(name, 0) or 0)
+            if used >= max_count:
+                vetoes.append("cargo_max_limit_full")
+        if self._matches_region_avoid(cand.cargo, pref_policy):
+            vetoes.append("region_avoid")
+        return vetoes
 
-    def _obligation_action(
-        self,
-        driver_id: str,
-        status: dict[str, Any],
-        now_min: int,
-        now_wall: str,
-        month_end_min: int,
-        directive: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """确定性执行【日期任务】(到坐标停留) + 【临近期限的区域配额】(去该地找货)。
-        坐标/日期/地名/天数全部来自 LLM 对偏好的编译；代码只在该去的日子可靠执行。绝不抛异常。"""
-        try:
-            lat = float(status["current_lat"])
-            lng = float(status["current_lng"])
-            cmd = _now_md(now_wall)
-            # 1) 当日日期任务：先到坐标，再停留要求时长
-            for t in directive.get("dated_tasks") or []:
-                if _parse_md(t.get("date", "")) != cmd or cmd is None:
-                    continue
-                key = "%s@%.4f,%.4f" % (t["date"], t["lat"], t["lng"])
-                if self._memory.is_dated_done(driver_id, key):
-                    continue
-                if tools.haversine_km(lat, lng, t["lat"], t["lng"]) > 1.5:
-                    self._logger.info("dated_task 前往 driver=%s %s", driver_id, t)
-                    return {"action": "reposition", "params": {"latitude": t["lat"], "longitude": t["lng"]}}
-                self._memory.mark_dated_done(driver_id, key)
-                dur = min(max(int(t.get("wait_minutes") or 0), 1) + 10, guardrails.MAX_WAIT_MINUTES)
-                self._logger.info("dated_task 到达停留 driver=%s wait=%s", driver_id, dur)
-                return {"action": "wait", "params": {"duration_minutes": dur}}
-            # 2) 区域配额：临近期限仍未达标 → 去该地找货（在那儿由 LLM 接含该地名的货）
-            rt = directive.get("region_target")
-            if isinstance(rt, dict) and rt.get("need_days", 0) > 0:
-                done = self._memory.region_days_done(driver_id, rt["keyword"])
-                remaining = rt["need_days"] - len(done)
-                today_idx = now_min // 1440
-                days_left = max(0, (month_end_min - now_min) // 1440)
-                if remaining > 0 and today_idx not in done and remaining >= days_left - 1:
-                    if tools.haversine_km(lat, lng, rt["lat"], rt["lng"]) > 3.0:
-                        self._logger.info(
-                            "region_quota 紧急前往 driver=%s remaining=%s days_left=%s", driver_id, remaining, days_left
-                        )
-                        return {"action": "reposition", "params": {"latitude": rt["lat"], "longitude": rt["lng"]}}
-            return None
-        except Exception as e:
-            self._logger.warning("obligation 计算失败: %s", e)
-            return None
+    def _candidate_score(
+        self, cand: CandidateFact, pref_policy: dict[str, Any], ledger: dict[str, Any], sim_min: int
+    ) -> float:
+        active_min = max(1, cand.pickup_min + cand.wait_min + cand.transport_min)
+        net = cand.net_yuan_before_pref
+        nph = net / (active_min / 60.0)
+        score = net + 5.0 * nph + 12.0 * cand.near_end_cargo_seen - 0.35 * cand.pickup_km
+        score += self._target_bonus(cand, pref_policy, ledger, sim_min)
+        for limit in self._long_haul_limits(pref_policy):
+            threshold = int(limit.get("threshold_minutes", 480) or 480)
+            if cand.transport_min > threshold:
+                score -= 150.0
+        if cand.finish_min - sim_min > 20 * 60:
+            score -= 300.0
+        return score
 
-    def _active_quota_categories(self, driver_id: str, ir: dict[str, Any], now_wall: str) -> list[str]:
-        """本月仍未达标的品类配额关键词(供候选 surface)。品类/单数/月份来自 LLM 编译，零偏好常量。"""
-        cats: list[str] = []
-        try:
-            cmd = _now_md(now_wall)
-            if not cmd:
-                return cats
-            cur_month = cmd[0]
-            for q in ir.get("category_quotas") or []:
-                if int(q.get("month") or 0) != cur_month:
-                    continue
-                cat = str(q.get("category") or "").strip()
-                if not cat:
-                    continue
-                done = self._memory.category_orders_done(driver_id, cat, cur_month)
-                if int(q.get("min_orders") or 0) - done > 0:
-                    cats.append(cat)
-        except Exception as e:
-            self._logger.warning("active_quota_categories 失败: %s", e)
-        return cats
+    def _target_bonus(
+        self, cand: CandidateFact, pref_policy: dict[str, Any], ledger: dict[str, Any], sim_min: int
+    ) -> float:
+        name = self._cargo_name(cand.cargo)
+        if not name:
+            return 0.0
+        bonus = 0.0
+        counts = ledger.get("cargo_name_counts_by_month") or {}
+        now_month = (_SIMULATION_EPOCH + timedelta(minutes=sim_min)).month
+        for target in self._cargo_targets(pref_policy):
+            target_name = str(target.get("cargo_name", "") or "").strip()
+            if not target_name or target_name != name:
+                continue
+            try:
+                month = int(target.get("month"))
+                min_count = int(target.get("min_count"))
+            except (TypeError, ValueError):
+                continue
+            month_key = f"2026-{month:02d}"
+            used = int((counts.get(month_key) or {}).get(name, 0) or 0)
+            shortfall = max(0, min_count - used)
+            if shortfall <= 0:
+                continue
+            penalty = self._target_penalty_amount(target, default=700.0)
+            days_left_factor = 1.0 + max(0, now_month - month + 1) * 0.35
+            bonus += (penalty + 0.12 * penalty * shortfall) * days_left_factor
+        return bonus
 
-    def _quota_action(
-        self,
-        driver_id: str,
-        status: dict[str, Any],
-        ir: dict[str, Any],
-        now_min: int,
-        now_wall: str,
-        month_end_min: int,
-        candidates: list[dict[str, Any]],
-        windows: list[Any],
-        off_set: set[int],
-    ) -> dict[str, Any] | None:
-        """确定性履约【月度品类配额】：本月必须接满 N 单某品类。
-        有干净(不违规/不跨休息/不落整休日)的该品类候选就接最赚的一单；本地没有且落后节奏 → 广查抓该品类货。
-        品类/单数/月份全部来自 LLM 编译；代码只做计数 + 文本匹配 + 接单。绝不抛异常。"""
-        try:
-            quotas = ir.get("category_quotas") or []
-            if not quotas:
-                return None
-            cmd = _now_md(now_wall)
-            if not cmd:
-                return None
-            cur_month = cmd[0]
-            active: list[tuple[dict[str, Any], str, int]] = []
-            for q in quotas:
-                if int(q.get("month") or 0) != cur_month:
+    def _current_rest_wait_minutes(self, status: dict[str, Any], pref_policy: dict[str, Any]) -> int | None:
+        sim_min = int(status.get("simulation_progress_minutes", 0) or 0)
+        for start, end in self._rest_intervals_around(sim_min, sim_min + 1, pref_policy):
+            if start <= sim_min < end:
+                return max(1, min(_MAX_WAIT_MINUTES, end - sim_min))
+        return None
+
+    def _next_useful_wait_minutes(self, sim_min: int, pref_policy: dict[str, Any]) -> int:
+        next_rest = None
+        for start, end in self._rest_intervals_around(sim_min, sim_min + 24 * 60, pref_policy):
+            if sim_min < start:
+                next_rest = (start, end)
+                break
+            if start <= sim_min < end:
+                return max(1, end - sim_min)
+        if next_rest and next_rest[0] - sim_min <= 240:
+            return max(1, min(_MAX_WAIT_MINUTES, next_rest[1] - sim_min))
+        return 120
+
+    def _interval_overlaps_forbidden_window(self, start_min: int, end_min: int, pref_policy: dict[str, Any]) -> bool:
+        return any(_interval_overlap(start_min, end_min, s, e) for s, e in self._rest_intervals_around(start_min, end_min, pref_policy))
+
+    def _rest_intervals_around(self, start_min: int, end_min: int, pref_policy: dict[str, Any]) -> list[tuple[int, int]]:
+        windows = self._rest_windows(pref_policy)
+        if not windows:
+            return []
+        first_day = start_min // 1440 - 1
+        last_day = max(first_day, end_min // 1440 + 1)
+        intervals: list[tuple[int, int]] = []
+        for day in range(first_day, last_day + 1):
+            for window in windows:
+                if not self._window_applies_to_day(window, day):
                     continue
-                cat = str(q.get("category") or "").strip()
-                need = int(q.get("min_orders") or 0)
-                if not cat or need <= 0:
-                    continue
-                remaining = need - self._memory.category_orders_done(driver_id, cat, cur_month)
-                if remaining > 0:
-                    active.append((q, cat, remaining))
-            if not active:
-                return None
-            # 少一单罚款越高越先履约(不可补救/罚额高的配额优先)
-            active.sort(key=lambda x: float(x[0].get("penalty_per_unit") or 0), reverse=True)
-            days_left = max(0, (month_end_min - now_min) // 1440)
-            # 长途阈值(若有月度长途上限)：配额履约优先挑【非长途】的该品类货，别白烧长途配额
-            lh_thr = None
-            for cap in ir.get("monthly_count_caps") or []:
-                if str(cap.get("field") or "") == "cost_time_minutes" and cap.get("threshold") is not None:
-                    try:
-                        lh_thr = float(cap["threshold"])
-                        break
-                    except (TypeError, ValueError):
-                        pass
+                sh = _optional_int(window.get("start_hour"), 21)
+                eh = _optional_int(window.get("end_hour"), 6)
+                s = day * 1440 + sh * 60
+                e = day * 1440 + eh * 60
+                if e <= s:
+                    e += 1440
+                intervals.append((s, e))
+        intervals.sort()
+        return intervals
 
-            # 配额关键词等值对齐：评分按 cargo_name 与品类【完全相等】计数，履约判定必须同口径，
-            # 否则把超串品类(如"其他X")的单计入配额→自以为凑满、评分照罚。
-            known = self._memory.cargo_names(driver_id)
-            snap_map = {cat: tools.snap_category(cat, known) for _q, cat, _r in active}
-
-            def _clean(c: dict[str, Any], cat: str) -> bool:
-                # 配额货与普通单同用 60min 防撞余量(不再压线)：官方读数显示压线/高力度履约
-                # 在隐藏司机上的副作用罚款 ≫ 它省下的配额罚款，宁可少凑一单不赌作息。
-                name = str(c.get("cargo_name") or "")
-                snapped, st = snap_map.get(cat) or (cat, "unmapped")
-                matched = (name == snapped) if st != "unmapped" else (cat in name)
-                if not matched or c.get("violates"):
-                    return False
-                est = int(c.get("est_finish_min") or now_min)
-                if checker.overlaps_any_window(now_min, est, windows):
-                    return False
-                if off_set and (est // 1440) in off_set:
-                    return False
-                return True
-
-            for q, cat, remaining in active:
-                # 仅【顺路履约】：本地候选里有干净的该品类货 → 接最赚的一单。
-                # 不再广查 k=600 / 不再压线——官方探针分解显示高力度履约(广查/压线/迁移)在
-                # 隐藏司机上的副作用罚款(+40k~60k)远超省下的配额罚款；顺路履约保留了
-                # 履约的全部"无副作用部分"(零额外时间税/零额外里程/不赌作息)。
-                local = [c for c in candidates if _clean(c, cat)]
-                if local:
-                    best = self._pick_quota(local, lh_thr)
-                    self._logger.info(
-                        "quota 顺路履约 driver=%s 品类=%s 还差=%s 接=%s roi=%.0f",
-                        driver_id, cat, remaining, best["cargo_id"], float(best.get("roi_score") or 0),
-                    )
-                    return {"action": "take_order", "params": {"cargo_id": best["cargo_id"]}}
-            return None
-        except Exception as e:
-            self._logger.warning("quota 履约失败: %s", e)
-            return None
-
-    def _mark_monthly_caps(
-        self, driver_id: str, ir: dict[str, Any], now_wall: str, candidates: list[dict[str, Any]]
-    ) -> None:
-        """月度单数上限：本月已接达上限的那类单(如 >阈值的长途)，把后续命中候选标 violates。
-        阈值/上限来自 LLM 编译；代码只做数值比较 + 计数。绝不抛异常。"""
-        try:
-            caps = ir.get("monthly_count_caps") or []
-            if not caps:
-                return
-            cmd = _now_md(now_wall)
-            if not cmd:
-                return
-            cur_month = cmd[0]
-            for cap in caps:
-                field = str(cap.get("field") or "").strip()
-                thr = cap.get("threshold")
-                maxm = cap.get("max_per_month")
-                if not field or thr is None or maxm is None:
-                    continue
-                done = self._memory.monthly_predicate_count(driver_id, field, float(thr), cur_month)
-                if done < int(maxm):
-                    continue  # 还没到上限，允许接
-                for c in candidates:
-                    try:
-                        if float(c.get(field) or 0) > float(thr):
-                            c.setdefault("violates", []).append("本月该类单数已达上限")
-                    except (TypeError, ValueError):
-                        pass
-        except Exception as e:
-            self._logger.warning("monthly_caps 标注失败: %s", e)
+    def _rest_windows(self, pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
+        ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
+        raw = ir.get("rest_windows") if isinstance(ir.get("rest_windows"), list) else []
+        windows = [w for w in raw if isinstance(w, dict)]
+        if windows:
+            return windows
+        parsed: list[dict[str, Any]] = []
+        for item in pref_policy.get("duty_windows") or []:
+            if not isinstance(item, dict):
+                continue
+            text = " ".join(str(item.get(k, "")) for k in ("label", "window", "overnight_note"))
+            match = __import__("re").search(r"(\d{1,2}):\d{2}\s*[-至到]\s*(?:次日)?(\d{1,2}):\d{2}", text)
+            if not match:
+                continue
+            days = "all"
+            if any(token in text.lower() for token in ("weekend", "周末", "sat", "sun")):
+                days = "weekend"
+            elif any(token in text.lower() for token in ("weekday", "工作日", "平日", "mon", "fri")):
+                days = "weekday"
+            parsed.append(
+                {
+                    "label": str(item.get("label", "")),
+                    "days": days,
+                    "start_hour": int(match.group(1)),
+                    "end_hour": int(match.group(2)),
+                    "forbid_take_order": True,
+                    "forbid_reposition": True,
+                }
+            )
+        return parsed
 
     @staticmethod
-    def _pick_quota(cands: list[dict[str, Any]], lh_thr: float | None) -> dict[str, Any]:
-        """配额履约选单：先排除长途(优先非长途，别白烧长途配额)，再挑【赴装空驶最近】的一单。
-        配额罚款(数百~数千/单)远大于单票利润差，就近凑最省里程成本——避免为凑配额开很远去接货。"""
-        pool = cands
-        if lh_thr is not None:
-            short = [c for c in cands if float(c.get("cost_time_minutes") or 0) <= lh_thr]
-            if short:
-                pool = short
-        return min(pool, key=lambda c: float(c.get("deadhead_km") if c.get("deadhead_km") is not None else 1e9))
+    def _window_applies_to_day(window: dict[str, Any], day: int) -> bool:
+        days = str(window.get("days", "all") or "all").lower()
+        weekday = (_SIMULATION_EPOCH + timedelta(days=day)).weekday()
+        if "weekend" in days or "周末" in days:
+            return weekday >= 5
+        if "weekday" in days or "工作日" in days or "平日" in days:
+            return weekday < 5
+        return True
+
+    @staticmethod
+    def _long_haul_limits(pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
+        ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
+        raw = ir.get("long_haul_limits") if isinstance(ir.get("long_haul_limits"), list) else []
+        return [x for x in raw if isinstance(x, dict)]
+
+    @staticmethod
+    def _cargo_max_limits(pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
+        ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
+        raw = ir.get("cargo_max_limits") if isinstance(ir.get("cargo_max_limits"), list) else []
+        return [x for x in raw if isinstance(x, dict)]
+
+    @staticmethod
+    def _cargo_targets(pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
+        ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
+        raw = ir.get("cargo_targets") if isinstance(ir.get("cargo_targets"), list) else []
+        return [x for x in raw if isinstance(x, dict)]
+
+    @staticmethod
+    def _unknown_constraints(pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
+        ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
+        raw = ir.get("unknown_constraints") if isinstance(ir.get("unknown_constraints"), list) else []
+        return [x for x in raw if isinstance(x, dict)]
+
+    @staticmethod
+    def _guardian_downgrade_candidates(candidates: list[CandidateFact], guardian: dict[str, Any]) -> list[CandidateFact]:
+        blocked: set[str] = set()
+        for item in guardian.get("candidate_judgments") or []:
+            if not isinstance(item, dict):
+                continue
+            verdict = str(item.get("verdict") or "").lower()
+            cargo_id = str(item.get("id") or "").strip()
+            if cargo_id and verdict == "hard_avoid":
+                blocked.add(cargo_id)
+        if not blocked:
+            return candidates
+        out: list[CandidateFact] = []
+        for cand in candidates:
+            if cand.cargo_id in blocked:
+                cand.legal = False
+                cand.veto_reasons.append("guardian_hard_avoid")
+            out.append(cand)
+        return out
+
+    @staticmethod
+    def _matches_region_avoid(cargo: dict[str, Any], pref_policy: dict[str, Any]) -> bool:
+        ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
+        rules: list[dict[str, Any]] = []
+        for key in ("region_avoid", "origin_avoid"):
+            raw = ir.get(key) if isinstance(ir.get(key), list) else []
+            rules.extend(x for x in raw if isinstance(x, dict))
+        if not rules:
+            return False
+        start = cargo.get("start") if isinstance(cargo.get("start"), dict) else {}
+        end = cargo.get("end") if isinstance(cargo.get("end"), dict) else {}
+        start_text = " ".join(str(start.get(k, "") or "") for k in ("province", "city", "district", "address"))
+        end_text = " ".join(str(end.get(k, "") or "") for k in ("province", "city", "district", "address"))
+        for rule in rules:
+            keyword = str(rule.get("keyword") or rule.get("region") or "").strip()
+            if not keyword:
+                continue
+            field = str(rule.get("field") or "origin").lower()
+            if field in ("origin", "start") and keyword in start_text:
+                return True
+            if field in ("destination", "end") and keyword in end_text:
+                return True
+            if field in ("either", "any", "all") and (keyword in start_text or keyword in end_text):
+                return True
+        return False
+
+    def _merge_preference_target_memory(
+        self, driver_id: str, policy: dict[str, Any], prefs: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        ir = policy.get("machine_ir") if isinstance(policy.get("machine_ir"), dict) else {}
+        raw_targets = ir.get("cargo_targets") if isinstance(ir.get("cargo_targets"), list) else []
+        targets = [dict(t) for t in raw_targets if isinstance(t, dict)]
+        for target in targets:
+            if "penalty_amount" not in target:
+                penalty = self._infer_target_penalty_amount(target, prefs)
+                if penalty is not None:
+                    target["penalty_amount"] = penalty
+        ledger = self._preference_ledger(driver_id)
+        memory = [dict(t) for t in self._target_memory_by_driver.get(driver_id, [])]
+
+        current_months = [self._target_month(t) for t in targets]
+        current_months = [m for m in current_months if m is not None]
+        current_month = max(current_months, default=None)
+        if current_month is not None and any(bool(t.get("makeup_from_previous")) for t in targets):
+            existing_keys = {(self._target_month(t), str(t.get("cargo_name") or "")) for t in targets}
+            counts = ledger.get("cargo_name_counts_by_month") or {}
+            for old in memory:
+                old_month = self._target_month(old)
+                old_name = str(old.get("cargo_name") or "").strip()
+                old_min = self._target_min_count(old)
+                if old_month is None or not old_name or old_min <= 0 or old_month >= current_month:
+                    continue
+                month_key = f"2026-{old_month:02d}"
+                used = int((counts.get(month_key) or {}).get(old_name, 0) or 0)
+                shortfall = max(0, old_min - used)
+                key = (current_month, old_name)
+                if shortfall > 0 and key not in existing_keys:
+                    targets.append(
+                        {
+                            "month": current_month,
+                            "cargo_name": old_name,
+                            "min_count": shortfall,
+                            "penalty_amount": self._target_penalty_amount(old, default=700.0),
+                            "makeup_from_previous": True,
+                            "makeup_for_month": old_month,
+                        }
+                    )
+                    existing_keys.add(key)
+
+        merged_memory = memory[:]
+        seen_memory = {(self._target_month(t), str(t.get("cargo_name") or "")) for t in merged_memory}
+        for target in targets:
+            month = self._target_month(target)
+            name = str(target.get("cargo_name") or "").strip()
+            min_count = self._target_min_count(target)
+            if month is None or not name or min_count <= 0:
+                continue
+            key = (month, name)
+            if key not in seen_memory:
+                merged_memory.append(
+                    {
+                        "month": month,
+                        "cargo_name": name,
+                        "min_count": min_count,
+                        "penalty_amount": self._target_penalty_amount(target, default=700.0),
+                    }
+                )
+                seen_memory.add(key)
+        self._target_memory_by_driver[driver_id] = merged_memory
+
+        if not isinstance(policy.get("machine_ir"), dict):
+            policy["machine_ir"] = {}
+        policy["machine_ir"]["cargo_targets"] = targets
+        self._logger.info(
+            "target_memory driver=%s targets=%s memory=%s",
+            driver_id,
+            json.dumps(targets, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(merged_memory, ensure_ascii=False, separators=(",", ":")),
+        )
+        return policy
+
+    @staticmethod
+    def _target_month(target: dict[str, Any]) -> int | None:
+        value = target.get("month")
+        if value is None:
+            scope = str(target.get("scope", "") or "")
+            match = __import__("re").search(r"2026[-年](\d{1,2})|(\d{1,2})月", scope)
+            value = (match.group(1) or match.group(2)) if match else None
+        try:
+            month = int(value)
+        except (TypeError, ValueError):
+            return None
+        return month if 1 <= month <= 12 else None
+
+    @staticmethod
+    def _target_min_count(target: dict[str, Any]) -> int:
+        for key in ("min_count", "target", "count"):
+            try:
+                value = int(target.get(key))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return 0
+
+    @staticmethod
+    def _target_penalty_amount(target: dict[str, Any], *, default: float) -> float:
+        try:
+            value = float(target.get("penalty_amount"))
+        except (TypeError, ValueError):
+            return default
+        if value <= 0:
+            return default
+        return min(10000.0, value)
+
+    @staticmethod
+    def _infer_target_penalty_amount(target: dict[str, Any], prefs: list[dict[str, Any]]) -> float | None:
+        name = str(target.get("cargo_name") or "").strip()
+        month = ModelDecisionService._target_month(target)
+        for pref in prefs:
+            if not isinstance(pref, dict):
+                continue
+            text = str(pref.get("content") or "")
+            if name and name not in text:
+                continue
+            if month is not None and f"{month}月" not in text and f"{month:02d}月" not in text:
+                if not any(token in text for token in ("欠额", "补", "指标", "必须", "至少")):
+                    continue
+            try:
+                penalty = float(pref.get("penalty_amount"))
+            except (TypeError, ValueError):
+                continue
+            if penalty > 0:
+                return penalty
+        return None
+
+    @staticmethod
+    def _should_expand_market(first_pass: list[CandidateFact], budget_guard: bool) -> bool:
+        if budget_guard:
+            return False
+        legal = [c for c in first_pass if c.legal]
+        if len(first_pass) < 60 or len(legal) < 10:
+            return True
+        best_net = max((c.net_yuan_before_pref for c in legal), default=0.0)
+        best_nph = max((c.net_per_hour_before_pref for c in legal), default=0.0)
+        return best_net < 400.0 and best_nph < 45.0
+
+
+
+
+
+
+    def _observe_current_market(
+        self, driver_id: str, status: dict[str, Any], budget_guard: bool
+    ) -> list[dict[str, Any]]:
+        lat = float(status["current_lat"])
+        lng = float(status["current_lng"])
+        k = 120 if budget_guard else 220
+        resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=k)
+        batch = resp.get("items") if isinstance(resp.get("items"), list) else []
+        self._logger.info("market observation lat=%.4f lng=%.4f k=%s returned=%s", lat, lng, k, len(batch))
+        return [item for item in batch if isinstance(item, dict) and isinstance(item.get("cargo"), dict)]
+
+    def _preference_guardian_council(
+        self,
+        status: dict[str, Any],
+        recent: list[dict[str, Any]],
+        candidates: list[CandidateFact],
+        cumulative_tokens: int,
+        pref_policy: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._agent_json(
+            "Preference_Interpreter_Risk_Guardian_Agent",
+            (
+                "你是 Preference Interpreter Agent + Legality & Risk Judge Agent。"
+                "你不做最终动作，只把候选货源按可见 preferences 的偏好风险分组，供最终 Arbiter 使用。"
+                "必须优先使用 compiled_preference_policy；只有 policy 信息不足时才回读原始 preferences。"
+                "候选事实里的 active_interval 是从开始去提货到完成运输的原子占用区间，不能拆开插入休息。"
+                "如果偏好要求某个时段停车/熄火/休息/不得接单/不得空驶，任何 take_order/reposition "
+                "占用区间与该窗口重叠都应 hard_avoid。"
+                "跨午夜窗口必须向前归属：例如 23:00-06:00 中的 00:30 属于前一日夜间窗口。"
+                "若偏好限制运输时长超过 N 小时的月度数量，用 transport_min 判断，最多 N 单表示第 N 单允许。"
+                "若偏好要求某月某货类至少接满 N 单，结合 ledger 的货类计数，给相关货类更高优先级。"
+                "不要写死公开集、driver_id 或原始数据；只能依据可见偏好、ledger 和候选事实。"
+            ),
+            {
+                "state": self._state_summary(status),
+                "preferences_visible_now": status.get("preferences") or [],
+                "compiled_preference_policy": self._compact_policy(pref_policy),
+                "preference_ledger": self._preference_ledger(str(status.get("driver_id", ""))),
+                "recent_actions": [self._compact_history(r) for r in recent[-6:]],
+                "candidate_facts": [self._candidate_prompt(c) for c in candidates],
+                "output_schema": {
+                    "preference_interpretation": "brief",
+                    "monthly_targets": [{"month": "YYYY-MM or unknown", "cargo_name": "string", "progress": "brief"}],
+                    "current_window_status": "inside_rest|near_rest_start|free_to_act|unclear",
+                    "must_wait": "boolean",
+                    "recommended_wait_minutes": "integer 1..1440 or null",
+                    "candidate_judgments": [
+                        {
+                            "id": "cargo id",
+                            "verdict": "prefer|allow|soft_avoid|hard_avoid",
+                            "risk": "brief",
+                            "preference_value": "brief",
+                        }
+                    ],
+                    "actionable_cargo_ids": ["ids with prefer or allow verdict"],
+                    "hard_avoid_cargo_ids": ["ids with hard_avoid verdict"],
+                    "critic_note": "brief",
+                },
+            },
+        )
+
+
+    @staticmethod
+    def _compact_policy(policy: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in policy.items() if k != "_signature"}
+
+
+    def _run_deterministic_market_scout_queries(
+        self, driver_id: str, status: dict[str, Any], first_pass: list[CandidateFact], budget_guard: bool
+    ) -> list[dict[str, Any]]:
+        if budget_guard:
+            return []
+        seeds: list[tuple[float, float, str]] = []
+        for cand in sorted(first_pass, key=lambda c: (c.legal, c.net_yuan_before_pref, c.near_end_cargo_seen), reverse=True)[:4]:
+            for key in ("start", "end"):
+                point = self._compact_point(cand.cargo.get(key))
+                if point:
+                    seeds.append((float(point["lat"]), float(point["lng"]), f"{cand.cargo_id}:{key}"))
+        for point in self._observed_points_by_driver.get(str(status.get("driver_id", "")), [])[:4]:
+            seeds.append((float(point["lat"]), float(point["lng"]), "memory_hotspot"))
+
+        items: list[dict[str, Any]] = []
+        seen: set[tuple[int, int]] = set()
+        for lat, lng, purpose in seeds[:2]:
+            key = (round(lat * 1000), round(lng * 1000))
+            if key in seen:
+                continue
+            seen.add(key)
+            resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=120)
+            batch = resp.get("items") if isinstance(resp.get("items"), list) else []
+            self._logger.info(
+                "deterministic scout query lat=%.4f lng=%.4f k=120 returned=%s purpose=%s",
+                lat,
+                lng,
+                len(batch),
+                purpose,
+            )
+            items.extend(item for item in batch if isinstance(item, dict) and isinstance(item.get("cargo"), dict))
+        return items
+
+    def _agent_json(self, agent_name: str, system: str, payload: dict[str, Any]) -> dict[str, Any]:
+        request = {
+            "enable_thinking": self._enable_thinking,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        system
+                        + " 只输出一个 JSON 对象；不要 Markdown；不要 JSON 外解释；"
+                        + "不得建议读取或解析任何原始数据文件。"
+                    ),
+                },
+                {"role": "user", "content": json.dumps({"agent_name": agent_name, **payload}, ensure_ascii=False)},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        resp = self._api.model_chat_completion(request)
+        choices = resp.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError(f"{agent_name} missing choices")
+        content = choices[0].get("message", {}).get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError(f"{agent_name} empty content")
+        data = json.loads(content)
+        if not isinstance(data, dict):
+            raise ValueError(f"{agent_name} did not return object")
+        self._logger.info(
+            "agent_council_json agent=%s data=%s",
+            agent_name,
+            json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+        )
+        return data
+
+
+    def _build_candidate_facts(
+        self, status: dict[str, Any], items: list[dict[str, Any]], *, source: str
+    ) -> list[CandidateFact]:
+        sim_min = int(status.get("simulation_progress_minutes", 0) or 0)
+        current_lat = float(status["current_lat"])
+        current_lng = float(status["current_lng"])
+        cost_per_km = float(status.get("cost_per_km", _DEFAULT_COST_PER_KM) or _DEFAULT_COST_PER_KM)
+        speed_kmph = float(status.get("reposition_speed_km_per_hour", _DEFAULT_SPEED_KMPH) or _DEFAULT_SPEED_KMPH)
+        seen: set[str] = set()
+        facts: list[CandidateFact] = []
+        for item in items:
+            cargo = item.get("cargo") or {}
+            cargo_id = str(cargo.get("cargo_id", "") or "").strip()
+            if not cargo_id or cargo_id in seen:
+                continue
+            seen.add(cargo_id)
+            try:
+                start_lat, start_lng = _cargo_point(cargo, "start")
+                end_lat, end_lng = _cargo_point(cargo, "end")
+                pickup_km = _haversine_km(current_lat, current_lng, start_lat, start_lng)
+                haul_km = _haversine_km(start_lat, start_lng, end_lat, end_lng)
+                pickup_min = _distance_minutes(pickup_km, speed_kmph) if pickup_km > 1e-6 else 0
+                arrival_min = sim_min + pickup_min
+                wait_min = self._load_wait_minutes(cargo, arrival_min)
+                transport_min = int(cargo.get("cost_time_minutes", 0) or 0)
+                finish_min = arrival_min + wait_min + transport_min
+                legal, vetoes = self._legality(cargo, arrival_min, finish_min)
+                price = _cargo_price_yuan(cargo)
+                cost = (pickup_km + haul_km) * cost_per_km
+                active_min = max(1, pickup_min + wait_min + transport_min)
+                net = price - cost
+                facts.append(
+                    CandidateFact(
+                        cargo_id=cargo_id,
+                        cargo=cargo,
+                        source=source,
+                        query_km=float(item.get("distance_km", pickup_km) or pickup_km),
+                        pickup_km=pickup_km,
+                        haul_km=haul_km,
+                        pickup_min=pickup_min,
+                        wait_min=wait_min,
+                        transport_min=transport_min,
+                        finish_min=finish_min,
+                        price_yuan=price,
+                        cost_yuan=cost,
+                        net_yuan_before_pref=net,
+                        net_per_hour_before_pref=net / (active_min / 60.0),
+                        near_end_cargo_seen=self._observed_next_count(cargo, items),
+                        legal=legal,
+                        veto_reasons=vetoes,
+                    )
+                )
+            except Exception as exc:
+                self._logger.debug("candidate skipped cargo_id=%s error=%s", cargo_id, exc)
+        return facts
+
+    def _select_prompt_candidates(
+        self, facts: list[CandidateFact], status: dict[str, Any], budget_guard: bool
+    ) -> list[CandidateFact]:
+        limit = 7 if budget_guard else 10
+        by_id: dict[str, CandidateFact] = {}
+        selected: list[CandidateFact] = []
+        pref_text = " ".join(
+            str(p.get("content", p)) if isinstance(p, dict) else str(p)
+            for p in (status.get("preferences") or [])
+        )
+        legal_facts = [c for c in facts if c.legal]
+        pref_hits = [
+            c for c in legal_facts if self._cargo_name(c.cargo) and self._cargo_name(c.cargo) in pref_text
+        ]
+
+        def add_bucket(bucket: list[CandidateFact], quota: int) -> None:
+            added = 0
+            for cand in bucket:
+                if cand.cargo_id in by_id:
+                    continue
+                by_id[cand.cargo_id] = cand
+                selected.append(cand)
+                added += 1
+                if added >= quota or len(selected) >= limit:
+                    return
+
+        add_bucket(sorted(pref_hits, key=lambda c: c.net_yuan_before_pref, reverse=True), 4 if not budget_guard else 2)
+        add_bucket(sorted(legal_facts, key=lambda c: c.net_yuan_before_pref, reverse=True), 3)
+        add_bucket(sorted(legal_facts, key=lambda c: c.net_per_hour_before_pref, reverse=True), 2)
+        add_bucket(sorted(legal_facts, key=lambda c: c.near_end_cargo_seen, reverse=True), 1)
+        add_bucket(sorted(legal_facts, key=lambda c: c.pickup_min + c.wait_min + c.transport_min), 1)
+        add_bucket(sorted(legal_facts, key=lambda c: c.query_km), 1)
+
+        if len(selected) < limit:
+            add_bucket(
+                sorted(facts, key=lambda c: (not c.legal, -c.net_yuan_before_pref, -c.net_per_hour_before_pref, c.query_km)),
+                limit - len(selected),
+            )
+        return selected[:limit]
+
+    def _candidate_prompt(self, cand: CandidateFact) -> dict[str, Any]:
+        cargo_name = self._cargo_name(cand.cargo)
+        active_start = cand.finish_min - cand.pickup_min - cand.wait_min - cand.transport_min
+        active_dates = sorted(
+            {
+                (_SIMULATION_EPOCH + timedelta(minutes=m)).strftime("%Y-%m-%d")
+                for m in (active_start, max(active_start, cand.finish_min - 1))
+            }
+        )
+        if cand.finish_min - active_start > 24 * 60:
+            start_day = active_start // 1440
+            finish_day = max(active_start, cand.finish_min - 1) // 1440
+            active_dates = [
+                (_SIMULATION_EPOCH + timedelta(days=day)).strftime("%Y-%m-%d")
+                for day in range(start_day, finish_day + 1)
+            ]
+        return {
+            "id": cand.cargo_id,
+            "name": cargo_name,
+            "legal": cand.legal,
+            "veto": cand.veto_reasons,
+            "price": round(cand.price_yuan, 1),
+            "net0": round(cand.net_yuan_before_pref, 1),
+            "nph0": round(cand.net_per_hour_before_pref, 1),
+            "qkm": round(cand.query_km, 1),
+            "pkm": round(cand.pickup_km, 1),
+            "hkm": round(cand.haul_km, 1),
+            "pmin": cand.pickup_min,
+            "wmin": cand.wait_min,
+            "tmin": cand.transport_min,
+            "transport_min": cand.transport_min,
+            "transport_gt_8h": cand.transport_min > 480,
+            "active_min": cand.pickup_min + cand.wait_min + cand.transport_min,
+            "finish": _wall_text(cand.finish_min),
+            "active_interval": {
+                "start": _wall_text(active_start),
+                "finish": _wall_text(cand.finish_min),
+                "minutes": cand.pickup_min + cand.wait_min + cand.transport_min,
+                "days_spanned": max(1, (max(active_start, cand.finish_min - 1) // 1440) - (active_start // 1440) + 1),
+                "active_dates": active_dates,
+                "transport_minutes": cand.transport_min,
+                "pickup_minutes": cand.pickup_min,
+                "load_wait_minutes": cand.wait_min,
+                "month": _month_key(cand.finish_min),
+                "finish_hour": (cand.finish_min // 60) % 24,
+                "clock_hours": _covered_clock_hours(active_start, cand.finish_min),
+            },
+            "near_end": cand.near_end_cargo_seen,
+            "load_time": cand.cargo.get("load_time"),
+            "start": self._compact_point(cand.cargo.get("start")),
+            "end": self._compact_point(cand.cargo.get("end")),
+        }
+
+    @staticmethod
+    def _cargo_name(cargo: dict[str, Any]) -> str:
+        for key in ("cargo_name", "category", "cargo_type", "goods_type", "name"):
+            value = str(cargo.get(key, "") or "").strip()
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _compact_point(point: Any) -> dict[str, float] | None:
+        if not isinstance(point, dict):
+            return None
+        try:
+            return {"lat": round(float(point["lat"]), 3), "lng": round(float(point["lng"]), 3)}
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _load_wait_minutes(self, cargo: dict[str, Any], arrival_min: int) -> int:
+        raw = cargo.get("load_time")
+        if not isinstance(raw, list) or len(raw) != 2:
+            return 0
+        start = _parse_wall_minutes(str(raw[0]))
+        return 0 if start is None else max(0, start - arrival_min)
+
+    def _legality(self, cargo: dict[str, Any], arrival_min: int, finish_min: int) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        raw = cargo.get("load_time")
+        if isinstance(raw, list) and len(raw) == 2:
+            end = _parse_wall_minutes(str(raw[1]))
+            if end is not None and arrival_min > end:
+                reasons.append("late_load")
+        remove_min = _parse_wall_minutes(str(cargo.get("remove_time", "") or ""))
+        if remove_min is not None and arrival_min > remove_min:
+            reasons.append("removed")
+        if finish_min > _HORIZON_MINUTES:
+            reasons.append("after_horizon")
+        if int(cargo.get("cost_time_minutes", 0) or 0) <= 0:
+            reasons.append("bad_duration")
+        return not reasons, reasons
+
+    def _observed_next_count(self, cargo: dict[str, Any], items: list[dict[str, Any]]) -> int:
+        try:
+            end_lat, end_lng = _cargo_point(cargo, "end")
+        except Exception:
+            return 0
+        count = 0
+        for item in items:
+            other = item.get("cargo") or {}
+            if other.get("cargo_id") == cargo.get("cargo_id"):
+                continue
+            try:
+                start_lat, start_lng = _cargo_point(other, "start")
+            except Exception:
+                continue
+            if _haversine_km(end_lat, end_lng, start_lat, start_lng) <= 120:
+                count += 1
+        return count
+
+
+    def _remember_chosen_action(self, driver_id: str, action: dict[str, Any], candidates: list[CandidateFact]) -> None:
+        if action.get("action") != "take_order":
+            return
+        cargo_id = str((action.get("params") or {}).get("cargo_id", "")).strip()
+        cand = next((item for item in candidates if item.cargo_id == cargo_id), None)
+        if cand is None:
+            return
+        active_start = cand.finish_min - cand.pickup_min - cand.wait_min - cand.transport_min
+        self._chosen_orders_by_driver.setdefault(driver_id, []).append(
+            {
+                "cargo_id": cargo_id,
+                "name": self._cargo_name(cand.cargo) or "unknown",
+                "month": _month_key(cand.finish_min),
+                "active_start": active_start,
+                "finish": cand.finish_min,
+                "active_duration_min": cand.pickup_min + cand.wait_min + cand.transport_min,
+                "transport_min": cand.transport_min,
+                "pickup_min": cand.pickup_min,
+                "load_wait_min": cand.wait_min,
+            }
+        )
+
+    def _preference_ledger(self, driver_id: str) -> dict[str, Any]:
+        orders = self._chosen_orders_by_driver.get(driver_id, [])
+        name_counts: dict[str, dict[str, int]] = {}
+        active_duration_bins: dict[str, dict[str, int]] = {}
+        transport_duration_bins: dict[str, dict[str, int]] = {}
+        active_clock_hours: dict[str, int] = {}
+        for order in orders:
+            month = str(order.get("month") or "")
+            name = str(order.get("name") or "unknown")
+            name_counts.setdefault(month, {})
+            name_counts[month][name] = name_counts[month].get(name, 0) + 1
+
+            active_duration = int(order.get("active_duration_min", 0) or 0)
+            active_bins = active_duration_bins.setdefault(month, {"over_4h": 0, "over_8h": 0, "over_12h": 0})
+            if active_duration > 240:
+                active_bins["over_4h"] += 1
+            if active_duration > 480:
+                active_bins["over_8h"] += 1
+            if active_duration > 720:
+                active_bins["over_12h"] += 1
+
+            transport_duration = int(order.get("transport_min", 0) or 0)
+            transport_bins = transport_duration_bins.setdefault(month, {"over_4h": 0, "over_8h": 0, "over_12h": 0})
+            if transport_duration > 240:
+                transport_bins["over_4h"] += 1
+            if transport_duration > 480:
+                transport_bins["over_8h"] += 1
+            if transport_duration > 720:
+                transport_bins["over_12h"] += 1
+
+            for hour in _covered_clock_hours(int(order["active_start"]), int(order["finish"])):
+                key = f"{hour:02d}:00"
+                active_clock_hours[key] = active_clock_hours.get(key, 0) + 1
+        return {
+            "note": "factual memory of previous LLM-selected orders in this run; use only to interpret visible text preferences",
+            "orders_total": len(orders),
+            "cargo_name_counts_by_month": name_counts,
+            "transport_duration_bins_by_month": transport_duration_bins,
+            "active_duration_bins_by_month": active_duration_bins,
+            "active_clock_hour_counts": active_clock_hours,
+        }
+
+    def _state_summary(self, status: dict[str, Any]) -> dict[str, Any]:
+        sim_min = int(status.get("simulation_progress_minutes", 0) or 0)
+        return {
+            "driver_id": status.get("driver_id"),
+            "sim_min": sim_min,
+            "wall_time": status.get("simulation_wall_time") or _wall_text(sim_min),
+            "month": _month_key(sim_min),
+            "hour": (sim_min // 60) % 24,
+            "weekday": _weekday_text(sim_min),
+            "remaining_min": max(0, _HORIZON_MINUTES - sim_min),
+            "lat": round(float(status.get("current_lat", 0.0)), 4),
+            "lng": round(float(status.get("current_lng", 0.0)), 4),
+            "truck_length": status.get("truck_length"),
+            "completed": status.get("completed_order_count"),
+        }
+
+    @staticmethod
+    def _compact_history(record: dict[str, Any]) -> dict[str, Any]:
+        action = record.get("action") if isinstance(record.get("action"), dict) else {}
+        result = record.get("result") if isinstance(record.get("result"), dict) else {}
+        return {
+            "s": record.get("step"),
+            "a": action.get("action"),
+            "p": action.get("params"),
+            "elapsed": record.get("step_elapsed_minutes"),
+            "accepted": result.get("accepted"),
+            "end": record.get("simulation_end_time"),
+        }
+
+    @staticmethod
+    def _history_tokens(records: list[dict[str, Any]]) -> int:
+        total = 0
+        for record in records:
+            usage = record.get("token_usage")
+            if isinstance(usage, dict):
+                total += int(usage.get("total_tokens", 0) or 0)
+        return total
+
+    def _remember_observed_points(self, driver_id: str, items: list[dict[str, Any]]) -> None:
+        points = self._observed_points_by_driver.setdefault(driver_id, [])
+        for item in items:
+            cargo = item.get("cargo") or {}
+            try:
+                start_lat, start_lng = _cargo_point(cargo, "start")
+                price = _cargo_price_yuan(cargo)
+            except Exception:
+                continue
+            if any(_haversine_km(start_lat, start_lng, p["lat"], p["lng"]) < 25 for p in points):
+                continue
+            points.append({"lat": round(start_lat, 4), "lng": round(start_lng, 4), "price": round(price, 1)})
+        points.sort(key=lambda p: p["price"], reverse=True)
+        del points[20:]
