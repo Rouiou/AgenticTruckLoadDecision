@@ -294,6 +294,9 @@ class ModelDecisionService:
                 "数字示例(虚构,仅示意规则): 19:00-05:00 + 晚一个小时再休息 = 20:00-05:00。"
                 "每条约束必须输出 source_quote 字段=依据的偏好原文片段(逐字摘录,供审计回查)。"
                 "若原文暗示但未明说某约束(隐式约束),也要列出并标 low confidence,放入 unknown_constraints。"
+                "【周期严格匹配】cargo_targets/cargo_max_limits/long_haul_limits 都是【按月】计数的槽位。"
+                "若原文的数量限制是【按天/每天/一天/每日/每周/每隔】等非月度周期,schema 没有对应槽位——"
+                "严禁硬塞进月度槽位(每日2单≠每月2单,塞错会灾难性执行),必须整条放入 unknown_constraints 并注明真实周期。"
                 "若有至少/最多/不得/必须/罚/扣/指标，输出它们的优先级和计数口径。"
                 "若文本提到“上月没完成、欠额、本月补、接着补”，必须结合 preference_ledger 和历史目标语义"
                 "判断欠额来自哪一个旧指标；如果当前文本没有明说旧货类，但历史 policy/ledger 能确定旧货类，"
@@ -556,6 +559,14 @@ class ModelDecisionService:
                         continue
                     if not quote_ok(t):
                         demote(t, f"{fld} source_quote回找失败(疑似幻觉)", "high")
+                        continue
+                    # 周期一致性: 月度槽位的依据原文若是日/周周期('每天N单'≠'每月N单'),
+                    # 属于语义错配硬塞——三票一致也防不了,这里是确定性最后防线
+                    q = str(t.get("source_quote", ""))
+                    if q and any(w in q for w in ("每天", "一天", "每日", "每周", "每隔")) and not any(
+                        w in q for w in ("每月", "个月", "月度", "当月", "本月")
+                    ):
+                        demote(t, f"{fld} 周期错配(原文为日/周周期,槽位按月计数)", "high")
                         continue
                     if FEATURE_FLAGS.get("snap_vocab") and vocab:
                         snapped, st = _snap_category(name, vocab)
@@ -914,7 +925,6 @@ class ModelDecisionService:
         raw = ir.get("unknown_constraints") if isinstance(ir.get("unknown_constraints"), list) else []
         return [x for x in raw if isinstance(x, dict)]
 
-    @staticmethod
     def _apply_council_judgments(
         self, all_candidates: list[CandidateFact], review_set: list[CandidateFact], guardian: dict[str, Any]
     ) -> list[CandidateFact]:
@@ -1609,6 +1619,17 @@ class ModelDecisionService:
         for order in orders:
             month = str(order.get("month") or "")
             transport_minutes_by_month.setdefault(month, []).append(int(order.get("transport_min", 0) or 0))
+        # 按日接单计数(近8天)——守护层判断"每天最多/至少N单/接单间隔"类台账依赖型偏好的事实基础
+        day_counts: dict[str, int] = {}
+        last_take_min: int | None = None
+        for order in orders:
+            try:
+                d = int(order.get("active_start", 0)) // 1440
+                day_counts[f"day{d}"] = day_counts.get(f"day{d}", 0) + 1
+                last_take_min = max(last_take_min or 0, int(order.get("active_start", 0)))
+            except (TypeError, ValueError):
+                pass
+        recent_days = dict(sorted(day_counts.items(), key=lambda kv: kv[0])[-8:])
         return {
             "note": "factual memory of previous LLM-selected orders in this run; use only to interpret visible text preferences",
             "orders_total": len(orders),
@@ -1617,6 +1638,8 @@ class ModelDecisionService:
             "transport_minutes_by_month": transport_minutes_by_month,
             "active_duration_bins_by_month": active_duration_bins,
             "active_clock_hour_counts": active_clock_hours,
+            "orders_per_day_recent": recent_days,
+            "last_order_start_min": last_take_min,
         }
 
     def _state_summary(self, status: dict[str, Any]) -> dict[str, Any]:
