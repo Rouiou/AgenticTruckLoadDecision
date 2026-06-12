@@ -39,7 +39,10 @@ def _now_md(now_wall: str) -> tuple[int, int] | None:
 
 
 # ===== R1 确定性执行 feature flags（形状参数，零偏好常量）=====
-DECIDE_MODE = "argmax"  # "argmax"=确定性选单 / "hybrid"=argmax提名+LLM单票否决 / "llm"=旧路径(本地影子对照用)
+# B版终态: "llm"=LLM选单掌舵(带台账prompt,守住每日量/间隔等需要台账的偏好——官方实证
+# argmax/hybrid 在隐藏司机上扣分364k vs llm线137.5k,差距=LLM用台账做的隐式履约)
+# + 确定性运营增强(候选按有效时薪排序/影子价格surface/R2广查/等值/全部修复)
+DECIDE_MODE = "llm"  # "argmax"=确定性选单 / "hybrid"=argmax提名+LLM单票否决 / "llm"=LLM选单掌舵
 SHADOW_LOG = False      # True=行为走旧llm路径,同时记录argmax提名(本地分歧率统计用,提交包必须False)
 REQUERY_MIN = 60        # 无正分候选时的再查间隔(分钟)
 SHADOW_CAP = 5000.0     # 配额影子价格封顶(元/单)
@@ -171,9 +174,11 @@ class ModelDecisionService:
         candidates = tools.prepare_candidates(
             items, now_min, month_end_min, top_n=10, quota_categories=active_cats
         )
-        # 按"当日生效"给候选打违规标签(只标注不删货)；planner 的每日查漏规避(avoid_filters,
-        # 编译器未覆盖偏好的当日补丁——确定性选单撤掉每步LLM后的安全网)一并生效
-        checker.annotate(candidates, ir, _now_md(now_wall), extra_filters=directive.get("avoid_filters"))
+        # 按"当日生效"给候选打违规标签(只标注不删货)；planner 的每日查漏规避(avoid_filters)
+        # 先过【配额冲突护栏】：planner 可能把"必须接满某品类"误写成规避(实测连续20天误报、
+        # 错杀配额品类代价无界)——与任何配额品类相交的 cargo_name 规避条目一律剔除(确定性)。
+        safe_avoid = self._sanitize_avoid_filters(directive.get("avoid_filters"), ir, driver_id)
+        checker.annotate(candidates, ir, _now_md(now_wall), extra_filters=safe_avoid)
         # 防溢出：会送达到"必须整休日"的单，提前标违规(否则前一天接的长途会占用整休日凌晨)
         if off_set:
             for c in candidates:
@@ -220,7 +225,7 @@ class ModelDecisionService:
         if SAFE_BQ and shadow_map:
             extra, now_min = self._safe_broad_query(
                 driver_id, status, ir, now_min, now_wall, month_end_min, shadow_map, windows, candidates,
-                directive.get("avoid_filters"),
+                safe_avoid,
             )
             if extra:
                 candidates = candidates + extra
@@ -392,9 +397,11 @@ class ModelDecisionService:
                 and not checker.overlaps_any_window(now_min, int(c.get("est_finish_min") or now_min), windows)
             ]
             if takeable:
-                best = max(takeable, key=lambda c: float(c.get("roi_score") or 0))
+                # 按有效时薪+影子价格选(替代绝对额roi——序贯调度正确排序键)
+                best = max(takeable, key=lambda c: tools.score_candidate(c, now_min, shadow_map))
                 self._logger.info(
-                    "anti-idle 改接 driver=%s %s roi=%.0f", driver_id, best["cargo_id"], float(best.get("roi_score") or 0)
+                    "anti-idle 改接 driver=%s %s rate=%.2f",
+                    driver_id, best["cargo_id"], tools.score_candidate(best, now_min, shadow_map),
                 )
                 action = {"action": "take_order", "params": {"cargo_id": best["cargo_id"]}}
 
@@ -448,6 +455,40 @@ class ModelDecisionService:
                 out[snapped] = min(ppu if ppu > 0 else SHADOW_CAP, SHADOW_CAP)
         except Exception as e:
             self._logger.warning("shadow_map 构造失败: %s", e)
+        return out
+
+    def _sanitize_avoid_filters(
+        self, avoid: Any, ir: dict[str, Any], driver_id: str
+    ) -> list[dict[str, Any]]:
+        """avoid_filters 配额冲突护栏：配额品类是【必做】项，planner 误把它写成规避会
+        全天封杀该品类(履约/广查/LLM三路全灭)——任何 value 与配额品类(等值对齐后)相互
+        包含的 cargo_name 规避条目，一律剔除并告警。纯文本比较，零偏好常量。"""
+        out: list[dict[str, Any]] = []
+        try:
+            known = self._memory.cargo_names(driver_id)
+            qcats: set[str] = set()
+            for q in ir.get("category_quotas") or []:
+                cat = str(q.get("category") or "").strip()
+                if cat:
+                    qcats.add(cat)
+                    snapped, _st = tools.snap_category(cat, known)
+                    qcats.add(snapped)
+            for f in avoid or []:
+                if not isinstance(f, dict):
+                    continue
+                if str(f.get("field") or "") == "cargo_name":
+                    vals = f.get("value")
+                    vals = vals if isinstance(vals, list) else [vals]
+                    hit = any(
+                        v and q and (str(v) in q or q in str(v)) for v in vals for q in qcats
+                    )
+                    if hit:
+                        self._logger.warning("avoid_filters 与配额品类冲突,剔除: %s", f)
+                        continue
+                out.append(f)
+        except Exception as e:
+            self._logger.warning("sanitize_avoid_filters 失败,保守置空: %s", e)
+            return []
         return out
 
     def _apply_floor_bonus(

@@ -198,6 +198,10 @@ def prepare_candidates(
 
         roi = price - COST_PER_KM_ASSUMED * total_km
         ppm = price / cost_time if cost_time > 0 else price
+        # 有效时薪 = 净收益 / 真实占用分钟(空驶+等窗+干线,下限=干线)——序贯调度的正确排序键:
+        # 绝对额排序看不见等窗("等14h的高价单"和"立刻能装的中价单"同序),时薪排序自动权衡
+        busy = max(est_finish - now_min, cost_time, 1)
+        rate = round(roi / busy, 3)
         out.append(
             {
                 "cargo_id": cid,
@@ -213,10 +217,11 @@ def prepare_candidates(
                 "预计完成时刻": min_to_wall(est_finish),
                 "est_finish_min": est_finish,
                 "roi_score": round(roi, 2),
+                "每分钟净收益": rate,
                 "price_per_min": round(ppm, 3),
             }
         )
-    out.sort(key=lambda c: c["roi_score"], reverse=True)
+    out.sort(key=lambda c: c["每分钟净收益"], reverse=True)
     top = out[:top_n]
     # —— 品类配额：把"必须接满"的品类货 surface 进候选(否则稀有品类会被 ROI Top-N 丢掉) ——
     cats = [str(k).strip() for k in (quota_categories or []) if str(k).strip()]
