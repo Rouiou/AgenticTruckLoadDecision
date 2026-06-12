@@ -26,16 +26,16 @@ _MAX_WAIT_MINUTES = _HORIZON_MINUTES
 
 # ===== K底Z甲 feature flags(形状参数,零偏好常量;全部默认=v19原行为,逐项验证后开启) =====
 FEATURE_FLAGS = {
-    "compile_temperature0": False,   # Day1: 编译temperature=0+单次重试
-    "rest_window_strict": False,     # Day1: 删默认兜底,五条件验证不满足→unknown
-    "compile_audit": False,          # Day1: 编译后本地audit九项+冲突剥离+family去重
-    "field_voting": False,           # Day1: 字段级3票(period/数量5票),不一致→降级unknown
-    "dynamic_longhaul": False,       # Day1: ledger存transport_min列表,按limit阈值现算
-    "snap_vocab": False,             # Day1: 品类等值snap词表(三处匹配点)
-    "council_v2": False,             # Day2: guardian→Council(top10对齐/±800限幅/must_wait/need_scout)
-    "monthend_scout": False,         # Day3: 月末安全广查闸门
-    "subgrad_shadow": False,         # Day3: 次梯度影子价格(关=0.12常数)
-    "ltd_reposition": False,         # Day4: 受限reposition(三重闸门)
+    "compile_temperature0": True,   # Day1: 编译temperature=0+单次重试
+    "rest_window_strict": True,     # Day1: 删默认兜底,五条件验证不满足→unknown
+    "compile_audit": True,          # Day1: 编译后本地audit九项+冲突剥离+family去重
+    "field_voting": True,           # Day1: 字段级3票(period/数量5票),不一致→降级unknown
+    "dynamic_longhaul": True,       # Day1: ledger存transport_min列表,按limit阈值现算
+    "snap_vocab": True,             # Day1: 品类等值snap词表(三处匹配点)
+    "council_v2": True,             # Day2: guardian→Council(top10对齐/±800限幅/must_wait/need_scout)
+    "monthend_scout": True,         # Day3: 月末安全广查闸门
+    "subgrad_shadow": True,         # Day3: 次梯度影子价格(关=0.12常数)
+    "ltd_reposition": True,         # Day4: 受限reposition(三重闸门)
     "dest_value": False,             # Day4: V落点价值表
 }
 
@@ -99,10 +99,30 @@ def _cargo_point(cargo: dict[str, Any], key: str) -> tuple[float, float]:
 
 
 def _cargo_price_yuan(cargo: dict[str, Any]) -> float:
-    price = float(cargo.get("price", 0.0) or 0.0)
-    # query_cargo in the provided simulator already normalizes raw cents to yuan.
-    # Keep a guard for unnormalized API payloads without dividing normal yuan prices twice.
-    return price / 100.0 if price > 10000 else price
+    # query_cargo 接口返回的 price 已是元(官方文档+全量数据实测确认)。
+    # 旧守卫(>10000才/100)会把全数据集仅有的49条万元级真高价单误除100倍——直接信任接口。
+    return float(cargo.get("price", 0.0) or 0.0)
+
+
+def _norm_text(s: str) -> str:
+    return "".join(str(s).split())
+
+
+def _snap_category(kw: str, known: set[str]) -> tuple[str, str]:
+    """编译出的品类关键词→运行时观测词表唯一对齐(评分按cargo_name完全相等计数)。
+    exact=完整品类名; snapped=唯一子串/超串; unmapped=无法唯一对齐(调用方降级)。零硬编码。"""
+    kw = str(kw or "").strip()
+    if not kw:
+        return kw, "unmapped"
+    if kw in known:
+        return kw, "exact"
+    sup = [n for n in known if kw in n]
+    if len(sup) == 1:
+        return sup[0], "snapped"
+    sub = [n for n in known if n in kw]
+    if len(sub) == 1:
+        return sub[0], "snapped"
+    return kw, "unmapped"
 
 
 def _optional_int(value: Any, default: int) -> int:
@@ -133,6 +153,7 @@ class CandidateFact:
     near_end_cargo_seen: int
     legal: bool
     veto_reasons: list[str] = field(default_factory=list)
+    llm_adjustment: float = 0.0  # Council调分(限幅±800): LLM影响有界,代码裁决
 
 
 class ModelDecisionService:
@@ -157,8 +178,12 @@ class ModelDecisionService:
         self._chosen_orders_by_driver: dict[str, list[dict[str, Any]]] = {}
         self._preference_policy_by_driver: dict[str, dict[str, Any]] = {}
         self._target_memory_by_driver: dict[str, list[dict[str, Any]]] = {}
+        # 运行时见过的真实品类名全集(query返回累积,零硬编码)——供编译audit的品类词表校验/snap对齐
+        self._seen_cargo_names_by_driver: dict[str, set[str]] = {}
+        self._last_reposition_day: dict[str, int] = {}
 
     def decide(self, driver_id: str) -> dict[str, Any]:
+        self._cur_driver_id = driver_id  # 供打分层回查该司机的观测热点(影子价格机会数估计)
         status = self._api.get_driver_status(driver_id)
         all_history = self._api.query_decision_history(driver_id, -1)
         records = all_history.get("records") if isinstance(all_history.get("records"), list) else []
@@ -184,8 +209,12 @@ class ModelDecisionService:
         self._remember_observed_points(driver_id, items)
         first_pass = self._build_candidate_facts(status_after_query, items, source="local")
         expansion_plan = None
-        if self._should_expand_market(first_pass, budget_guard):
-            extra_items = self._run_deterministic_market_scout_queries(driver_id, status_after_query, first_pass, budget_guard)
+        sim_min_q = int(status_after_query.get("simulation_progress_minutes", 0) or 0)
+        shortfall_cats = self._monthend_shortfall_targets(pref_policy, driver_id, sim_min_q)
+        if self._should_expand_market(first_pass, budget_guard) or shortfall_cats:
+            extra_items = self._run_deterministic_market_scout_queries(
+                driver_id, status_after_query, first_pass, budget_guard, shortfall_cats
+            )
             if extra_items:
                 items.extend(extra_items)
                 status_after_query = self._api.get_driver_status(driver_id)
@@ -199,14 +228,32 @@ class ModelDecisionService:
             json.dumps([self._candidate_prompt(c) for c in candidates], ensure_ascii=False, separators=(",", ":")),
         )
         if self._unknown_constraints(pref_policy) and candidates:
-            guardian = self._preference_guardian_council(
-                status_after_query,
-                recent,
-                candidates,
-                cumulative_tokens,
-                pref_policy,
-            )
-            all_candidates = self._guardian_downgrade_candidates(all_candidates, guardian)
+            if FEATURE_FLAGS.get("council_v2"):
+                # Council v2: 审【按确定性score排序的top-10】(与argmax对齐,堵"argmax选中
+                # guardian没见过的候选"缺口);未审候选在守护激活时不参与argmax(宁wait不接未审单)
+                sim_min_now = int(status_after_query.get("simulation_progress_minutes", 0) or 0)
+                ledger_now = self._preference_ledger(driver_id)
+                ranked = sorted(
+                    (c for c in all_candidates if c.legal and not self._deterministic_vetoes(c, pref_policy, ledger_now)),
+                    key=lambda c: self._candidate_score(c, pref_policy, ledger_now, sim_min_now),
+                    reverse=True,
+                )
+                review_set = ranked[:10]
+                guardian = self._preference_guardian_council(
+                    status_after_query, recent, review_set, cumulative_tokens, pref_policy
+                )
+                all_candidates = self._apply_council_judgments(all_candidates, review_set, guardian)
+                mw = guardian.get("must_wait")
+                if mw is True:
+                    rw = _optional_int(guardian.get("recommended_wait_minutes"), 120)
+                    dur = max(30, min(240, rw))  # 钳位; 确定性rest在decide入口已优先,不会被本分支覆盖
+                    self._logger.info("council must_wait driver=%s wait=%s", driver_id, dur)
+                    return {"action": "wait", "params": {"duration_minutes": dur}}
+            else:
+                guardian = self._preference_guardian_council(
+                    status_after_query, recent, candidates, cumulative_tokens, pref_policy
+                )
+                all_candidates = self._guardian_downgrade_candidates(all_candidates, guardian)
         action = self._deterministic_execution_decision(driver_id, status_after_query, all_candidates, pref_policy)
         self._remember_chosen_action(driver_id, action, all_candidates)
 
@@ -229,7 +276,7 @@ class ModelDecisionService:
         cached = self._preference_policy_by_driver.get(driver_id)
         if cached and cached.get("_signature") == signature:
             return cached
-        policy = self._agent_json(
+        policy = self._compile_once_or_vote(
             "Preference_Compiler_Agent",
             (
                 "你是一次性 Preference Multi-Agent Compiler。请在同一次回答中完成三个子 Agent 的工作："
@@ -239,11 +286,14 @@ class ModelDecisionService:
                 "最终只输出稳定、简短的经营 policy，供后续 Duty、Guardian、Arbiter 多 Agent 共用。"
                 "不要做最终动作，不要评价具体货源。"
                 "必须泛化到隐藏司机：只根据文本抽取约束，不要写死司机、月份、货类或公开集。"
-                "若文本有跨午夜时段，必须说明凌晨属于前一日夜间窗口；例如 23:00-06:00 中的周日00:30"
-                "属于周六23:00-周日06:00 这一夜。"
-                "若文本说晚两个小时再休息，表示休息开始时间顺延，结束时间不自动顺延。"
-                "强制自检：21:00-06:00 + 晚两个小时再休息 = 23:00-06:00；"
-                "不得输出 23:00-08:00，除非文本明确说晚两个小时起床、晚两个小时结束或休息结束顺延。"
+                "若文本有跨午夜时段，凌晨部分归属前一日夜间窗口：窗口 A点至次日B点 中位于午夜后的时刻，"
+                "属于【前一日A点起】的那一夜，不是当日的。"
+                "若文本说【晚 N 小时再休息】，表示休息开始时间顺延 N 小时，结束时间不自动顺延："
+                "原窗 A点至B点 → 新窗 (A+N)点至B点；严禁输出 (A+N)点至(B+N)点，"
+                "除非文本明确说晚 N 小时起床/晚 N 小时结束/休息结束顺延。"
+                "数字示例(虚构,仅示意规则): 19:00-05:00 + 晚一个小时再休息 = 20:00-05:00。"
+                "每条约束必须输出 source_quote 字段=依据的偏好原文片段(逐字摘录,供审计回查)。"
+                "若原文暗示但未明说某约束(隐式约束),也要列出并标 low confidence,放入 unknown_constraints。"
                 "若有至少/最多/不得/必须/罚/扣/指标，输出它们的优先级和计数口径。"
                 "若文本提到“上月没完成、欠额、本月补、接着补”，必须结合 preference_ledger 和历史目标语义"
                 "判断欠额来自哪一个旧指标；如果当前文本没有明说旧货类，但历史 policy/ledger 能确定旧货类，"
@@ -336,6 +386,7 @@ class ModelDecisionService:
                 },
             },
         )
+        policy = self._audit_policy(driver_id, policy, prefs)
         policy = self._merge_preference_target_memory(driver_id, policy, prefs)
         policy["_signature"] = signature
         self._preference_policy_by_driver[driver_id] = policy
@@ -347,6 +398,241 @@ class ModelDecisionService:
         return policy
 
 
+
+    def _compile_once_or_vote(self, agent_name: str, system: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """编译调用。field_voting 开启时同 prompt 独立跑 3 次,对 machine_ir 各列表字段做
+        【条目级结构签名多数票】——只出现 1 票的条目(疑似不稳定抽取/幻觉)整条降级进
+        unknown_constraints 交守护层,绝不硬写进执行器(错编比丢弃毒,DG8/73.5k 双实锤)。
+        unknown_constraints 自身取三票并集(多看无害,丢了才危险)。"""
+        if not FEATURE_FLAGS.get("field_voting"):
+            return self._agent_json(agent_name, system, payload)
+        votes: list[dict[str, Any]] = []
+        for _ in range(3):
+            try:
+                votes.append(self._agent_json(agent_name, system, payload))
+            except Exception as e:
+                self._logger.warning("compile vote attempt failed: %s", e)
+        if not votes:
+            raise ValueError("compile failed: all vote attempts errored")
+        base = votes[0]
+        if len(votes) == 1:
+            return base
+        skip_keys = {"label", "source_quote", "reason", "note", "why_unsupported", "preference_text", "overnight_note"}
+
+        def sig(entry: dict[str, Any]) -> str:
+            return json.dumps(
+                {k: v for k, v in sorted(entry.items()) if k not in skip_keys},
+                ensure_ascii=False, sort_keys=True,
+            )
+
+        ir_lists = ["rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits",
+                    "region_avoid", "origin_avoid", "destination_prefer", "region_min_targets",
+                    "date_or_weekday_rules", "makeup_targets"]
+        base_ir = base.get("machine_ir") if isinstance(base.get("machine_ir"), dict) else {}
+        demoted: list[dict[str, Any]] = []
+        for fld in ir_lists:
+            counts: dict[str, int] = {}
+            first: dict[str, dict[str, Any]] = {}
+            for v in votes:
+                ir = v.get("machine_ir") if isinstance(v.get("machine_ir"), dict) else {}
+                seen = set()
+                for e in ir.get(fld) or []:
+                    if not isinstance(e, dict):
+                        continue
+                    s = sig(e)
+                    if s in seen:
+                        continue
+                    seen.add(s)
+                    counts[s] = counts.get(s, 0) + 1
+                    first.setdefault(s, e)
+            base_ir[fld] = [first[s] for s, c in counts.items() if c >= 2]
+            for s, c in counts.items():
+                if c < 2:
+                    e = first[s]
+                    demoted.append({
+                        "preference_text": str(e.get("source_quote") or json.dumps(e, ensure_ascii=False)[:120]),
+                        "why_unsupported": f"compile_vote_unstable:{fld}",
+                        "risk_level": "medium",
+                    })
+                    self._logger.warning("compile vote demoted %s: %s", fld, json.dumps(e, ensure_ascii=False)[:150])
+        # unknown_constraints: 三票并集按文本去重
+        merged_unknown: list[dict[str, Any]] = []
+        seen_txt: set[str] = set()
+        for v in votes:
+            ir = v.get("machine_ir") if isinstance(v.get("machine_ir"), dict) else {}
+            for u in ir.get("unknown_constraints") or []:
+                if not isinstance(u, dict):
+                    continue
+                t = _norm_text(str(u.get("preference_text", "")))
+                if t and t not in seen_txt:
+                    seen_txt.add(t)
+                    merged_unknown.append(u)
+        base_ir["unknown_constraints"] = merged_unknown + demoted
+        base["machine_ir"] = base_ir
+        return base
+
+    def _audit_policy(self, driver_id: str, policy: dict[str, Any], prefs: list[Any]) -> dict[str, Any]:
+        """编译后本地 audit(确定性,零偏好常量): 九项检查 + rest五条件 + avoid×target冲突剥离
+        + semantic-family unknown去重。任何不合格约束【降级进 unknown_constraints 交守护层】,
+        绝不静默删除、绝不带病执行。"""
+        if not FEATURE_FLAGS.get("compile_audit"):
+            return policy
+        try:
+            ir = policy.get("machine_ir") if isinstance(policy.get("machine_ir"), dict) else None
+            if ir is None:
+                return policy
+            raw_all = _norm_text("".join(str(p.get("content", "")) for p in prefs if isinstance(p, dict)))
+            vocab = self._seen_cargo_names_by_driver.get(driver_id) or set()
+            unknowns = [u for u in (ir.get("unknown_constraints") or []) if isinstance(u, dict)]
+
+            def demote(entry: dict[str, Any], why: str, risk: str = "medium") -> None:
+                unknowns.append({
+                    "preference_text": str(entry.get("source_quote") or json.dumps(entry, ensure_ascii=False)[:120]),
+                    "why_unsupported": why, "risk_level": risk,
+                })
+                self._logger.warning("audit demoted: %s | %s", why, json.dumps(entry, ensure_ascii=False)[:150])
+
+            def quote_ok(entry: dict[str, Any]) -> bool:
+                q = _norm_text(str(entry.get("source_quote", "")))
+                return (not q) or (q in raw_all)  # 缺失宽容(兼容旧schema),给了但回找失败=幻觉
+
+            # 1) rest_windows: 时间锚点完整 + 钟点合法 + days枚举 + source_quote回找
+            kept = []
+            for w in ir.get("rest_windows") or []:
+                if not isinstance(w, dict):
+                    continue
+                try:
+                    sh, eh = int(w.get("start_hour")), int(w.get("end_hour"))
+                except (TypeError, ValueError):
+                    demote(w, "rest_window缺时间锚点(绝不按猜测小时执行)", "high")
+                    continue
+                if not (0 <= sh <= 23 and 0 <= eh <= 23):
+                    demote(w, "rest_window钟点越界", "high")
+                    continue
+                if not quote_ok(w):
+                    demote(w, "rest_window source_quote回找失败(疑似幻觉)", "high")
+                    continue
+                d = str(w.get("days", "all") or "all").lower()
+                w["days"] = d if d in ("all", "weekday", "weekend") else "all"
+                w["start_hour"], w["end_hour"] = sh, eh
+                kept.append(w)
+            ir["rest_windows"] = kept
+
+            # 2) cargo_targets / cargo_max_limits: month/数量/品类词表(snap)
+            for fld, cnt_key, allow_null_month in (
+                ("cargo_targets", "min_count", False),
+                ("cargo_max_limits", "max_count", True),
+            ):
+                kept = []
+                for t in ir.get(fld) or []:
+                    if not isinstance(t, dict):
+                        continue
+                    mon = t.get("month")
+                    if mon is None and not allow_null_month:
+                        demote(t, f"{fld}缺month")
+                        continue
+                    if mon is not None:
+                        try:
+                            mon = int(mon)
+                        except (TypeError, ValueError):
+                            demote(t, f"{fld} month非整数")
+                            continue
+                        if not (1 <= mon <= 12):
+                            demote(t, f"{fld} month越界")
+                            continue
+                        t["month"] = mon
+                    try:
+                        cnt = int(t.get(cnt_key))
+                    except (TypeError, ValueError):
+                        demote(t, f"{fld} {cnt_key}非整数")
+                        continue
+                    if cnt <= 0:
+                        demote(t, f"{fld} {cnt_key}非正数")
+                        continue
+                    t[cnt_key] = cnt
+                    name = str(t.get("cargo_name", "") or "").strip()
+                    if not name:
+                        demote(t, f"{fld} cargo_name为空")
+                        continue
+                    if not quote_ok(t):
+                        demote(t, f"{fld} source_quote回找失败(疑似幻觉)", "high")
+                        continue
+                    if FEATURE_FLAGS.get("snap_vocab") and vocab:
+                        snapped, st = _snap_category(name, vocab)
+                        if st == "unmapped":
+                            demote(t, f"品类[{name}]未唯一命中观测词表(等值计数会失配)")
+                            continue
+                        t["cargo_name"] = snapped
+                    kept.append(t)
+                ir[fld] = kept
+
+            # 3) long_haul_limits: threshold/max_count 正整数
+            kept = []
+            for l in ir.get("long_haul_limits") or []:
+                if not isinstance(l, dict):
+                    continue
+                try:
+                    thr, mc = int(l.get("threshold_minutes")), int(l.get("max_count"))
+                except (TypeError, ValueError):
+                    demote(l, "long_haul_limit字段非整数")
+                    continue
+                if thr <= 0 or mc < 0:
+                    demote(l, "long_haul_limit数值非法")
+                    continue
+                l["threshold_minutes"], l["max_count"] = thr, mc
+                kept.append(l)
+            ir["long_haul_limits"] = kept
+
+            # 4) region_avoid/origin_avoid: keyword非空 + 与配额目标品类互含→剥离交守护
+            target_names = {str(t.get("cargo_name", "")) for t in ir.get("cargo_targets") or [] if isinstance(t, dict)}
+            target_names.discard("")
+            for fld in ("region_avoid", "origin_avoid"):
+                kept = []
+                for r in ir.get(fld) or []:
+                    if not isinstance(r, dict):
+                        continue
+                    kw = str(r.get("keyword", "") or "").strip()
+                    if not kw:
+                        demote(r, f"{fld} keyword为空")
+                        continue
+                    if any(kw in tn or tn in kw for tn in target_names):
+                        demote(r, f"avoid[{kw}]与必做配额品类冲突,剥离交守护层(防误编封杀)", "high")
+                        continue
+                    kept.append(r)
+                ir[fld] = kept
+
+            # 5) semantic-family unknown 去重: 与已编译约束 source_quote 互为子串的 unknown=重复,删
+            cov_quotes = []
+            for fld in ("rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits",
+                        "region_avoid", "origin_avoid", "destination_prefer"):
+                for e in ir.get(fld) or []:
+                    if isinstance(e, dict):
+                        q = _norm_text(str(e.get("source_quote", "")))
+                        if q:
+                            cov_quotes.append(q)
+            deduped, seen_txt = [], set()
+            for u in unknowns:
+                txt = _norm_text(str(u.get("preference_text", "")))
+                if not txt or txt in seen_txt:
+                    continue
+                seen_txt.add(txt)
+                why = str(u.get("why_unsupported", ""))
+                covered = any(txt in q or q in txt for q in cov_quotes)
+                if covered and "other" not in why and "vote_unstable" not in why and "冲突" not in why:
+                    continue  # 已有executor覆盖的重复条目(kiki#5);投票降级/冲突剥离的保留
+                deduped.append(u)
+            ir["unknown_constraints"] = deduped
+            policy["machine_ir"] = ir
+            self._logger.info(
+                "audit_policy done: rest=%s targets=%s caps=%s lh=%s avoid=%s unknown=%s",
+                len(ir.get("rest_windows") or []), len(ir.get("cargo_targets") or []),
+                len(ir.get("cargo_max_limits") or []), len(ir.get("long_haul_limits") or []),
+                len(ir.get("region_avoid") or []) + len(ir.get("origin_avoid") or []),
+                len(deduped),
+            )
+        except Exception as e:
+            self._logger.warning("audit_policy failed(保留原policy): %s", e)
+        return policy
 
     def _deterministic_execution_decision(
         self, driver_id: str, status: dict[str, Any], candidates: list[CandidateFact], pref_policy: dict[str, Any]
@@ -374,9 +660,52 @@ class ModelDecisionService:
             )
             return {"action": "take_order", "params": {"cargo_id": best.cargo_id}}
 
+        repo = self._limited_reposition(driver_id, status, sim_min, pref_policy)
+        if repo is not None:
+            return repo
         wait = self._next_useful_wait_minutes(sim_min, pref_policy)
         self._logger.info("deterministic_wait no_positive_candidate wait=%s seen=%s", wait, len(candidates))
         return {"action": "wait", "params": {"duration_minutes": wait}}
+
+    def _limited_reposition(
+        self, driver_id: str, status: dict[str, Any], sim_min: int, pref_policy: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """受限主动迁移(三重闸门): 仅当①无正分候选(调用处保证) ②距下一休息窗>240分钟
+        ③最优观测热点的期望净值−迁移成本>200元。每日≤1次,迁移段不得与任何作息窗重叠。
+        治"冷区只能干等"的毛利黑洞;闸门保证不重蹈大空驶伤害。绝不抛异常。"""
+        if not FEATURE_FLAGS.get("ltd_reposition"):
+            return None
+        try:
+            day = sim_min // 1440
+            if self._last_reposition_day.get(driver_id) == day:
+                return None
+            nxt = [s for s, e in self._rest_intervals_around(sim_min, sim_min + 24 * 60, pref_policy) if s > sim_min]
+            if nxt and nxt[0] - sim_min <= 240:
+                return None  # 临近休息窗不折腾
+            lat = float(status.get("current_lat", 0) or 0)
+            lng = float(status.get("current_lng", 0) or 0)
+            best = None
+            for p in self._observed_points_by_driver.get(driver_id, [])[:8]:
+                dist = _haversine_km(lat, lng, float(p["lat"]), float(p["lng"]))
+                if dist < 30:
+                    continue  # 本来就在附近,迁移无意义
+                move_min = _distance_minutes(dist)
+                if nxt and sim_min + move_min + 120 > nxt[0]:
+                    continue  # 迁移+起码2小时作业必须全部落在休息窗前
+                ev = float(p.get("price", 0)) * 0.6 - dist * _DEFAULT_COST_PER_KM
+                if ev > 200 and (best is None or ev > best[0]):
+                    best = (ev, p, dist)
+            if best is None:
+                return None
+            self._last_reposition_day[driver_id] = day
+            _ev, p, dist = best
+            self._logger.info(
+                "limited_reposition driver=%s -> (%.4f,%.4f) dist=%.0fkm ev=%.0f", driver_id, p["lat"], p["lng"], dist, _ev
+            )
+            return {"action": "reposition", "params": {"latitude": float(p["lat"]), "longitude": float(p["lng"])}}
+        except Exception as e:
+            self._logger.warning("limited_reposition failed: %s", e)
+            return None
 
     def _deterministic_vetoes(
         self, cand: CandidateFact, pref_policy: dict[str, Any], ledger: dict[str, Any]
@@ -391,7 +720,12 @@ class ModelDecisionService:
             if cand.transport_min <= threshold:
                 continue
             month = _month_key(cand.finish_min)
-            used = int((ledger.get("transport_duration_bins_by_month") or {}).get(month, {}).get("over_8h", 0) or 0)
+            if FEATURE_FLAGS.get("dynamic_longhaul"):
+                # 按该limit自己的阈值现算(隐藏司机阈值可能是任意小时数;固定over_8h分箱会全口径错配)
+                mins = (ledger.get("transport_minutes_by_month") or {}).get(month, [])
+                used = sum(1 for m in mins if m > threshold)
+            else:
+                used = int((ledger.get("transport_duration_bins_by_month") or {}).get(month, {}).get("over_8h", 0) or 0)
             if used >= max_count:
                 vetoes.append("long_haul_quota_full")
         for limit in self._cargo_max_limits(pref_policy):
@@ -417,6 +751,7 @@ class ModelDecisionService:
         nph = net / (active_min / 60.0)
         score = net + 5.0 * nph + 12.0 * cand.near_end_cargo_seen - 0.35 * cand.pickup_km
         score += self._target_bonus(cand, pref_policy, ledger, sim_min)
+        score += cand.llm_adjustment  # Council调分(已限幅±800),LLM影响有界、代码裁决
         for limit in self._long_haul_limits(pref_policy):
             threshold = int(limit.get("threshold_minutes", 480) or 480)
             if cand.transport_min > threshold:
@@ -450,7 +785,20 @@ class ModelDecisionService:
                 continue
             penalty = self._target_penalty_amount(target, default=700.0)
             days_left_factor = 1.0 + max(0, now_month - month + 1) * 0.35
-            bonus += (penalty + 0.12 * penalty * shortfall) * days_left_factor
+            if FEATURE_FLAGS.get("subgrad_shadow"):
+                # 次梯度影子价格(拉格朗日松弛): 紧迫度λ=欠额/剩余机会数估计。
+                # 机会数=该品类近期日均可见单数(观测热点统计)×当月剩余天数;无观测→保守取欠额本身(λ=1)。
+                day_in_month = ((_SIMULATION_EPOCH + timedelta(minutes=sim_min)).day) if month == now_month else 1
+                days_left = max(1, 30 - day_in_month) if month == now_month else 30
+                seen_pts = sum(
+                    1 for p in self._observed_points_by_driver.get(getattr(self, "_cur_driver_id", ""), [])
+                    if str(p.get("cargo_name", "")) == name
+                )
+                est_chances = max(1.0, float(seen_pts) * days_left / 4.0)
+                lam = min(1.0, shortfall / est_chances)
+                bonus += penalty * (1.0 + lam * shortfall) * days_left_factor
+            else:
+                bonus += (penalty + 0.12 * penalty * shortfall) * days_left_factor
         return bonus
 
     def _current_rest_wait_minutes(self, status: dict[str, Any], pref_policy: dict[str, Any]) -> int | None:
@@ -486,6 +834,11 @@ class ModelDecisionService:
             for window in windows:
                 if not self._window_applies_to_day(window, day):
                     continue
+                if FEATURE_FLAGS.get("rest_window_strict"):
+                    # 缺时间锚点的窗口绝不按猜测小时数执行(隐藏司机窗口未知,猜=错配风险)；
+                    # 该窗已在编译audit阶段降级进 unknown_constraints 交守护层。
+                    if window.get("start_hour") is None or window.get("end_hour") is None:
+                        continue
                 sh = _optional_int(window.get("start_hour"), 21)
                 eh = _optional_int(window.get("end_hour"), 6)
                 s = day * 1440 + sh * 60
@@ -560,6 +913,53 @@ class ModelDecisionService:
         ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
         raw = ir.get("unknown_constraints") if isinstance(ir.get("unknown_constraints"), list) else []
         return [x for x in raw if isinstance(x, dict)]
+
+    @staticmethod
+    def _apply_council_judgments(
+        self, all_candidates: list[CandidateFact], review_set: list[CandidateFact], guardian: dict[str, Any]
+    ) -> list[CandidateFact]:
+        """Council v2 判定应用(权限有界): hard_avoid须带依据(source_quote/preference_index/
+        risk_reason),缺依据自动降级soft_avoid; soft_avoid按风险分级调分(low-80/medium-200/
+        high-500); score_adjustment限幅±800; 未审候选在守护激活时不参与argmax。LLM调分,代码裁决。"""
+        judg: dict[str, dict[str, Any]] = {}
+        for item in guardian.get("candidate_judgments") or []:
+            if isinstance(item, dict) and str(item.get("id") or "").strip():
+                judg[str(item["id"]).strip()] = item
+        reviewed_ids = {c.cargo_id for c in review_set}
+        soft_by_risk = {"low": -80.0, "medium": -200.0, "high": -500.0}
+        for cand in all_candidates:
+            if cand.cargo_id not in reviewed_ids:
+                if cand.legal:
+                    cand.legal = False
+                    cand.veto_reasons.append("council_unreviewed")
+                continue
+            item = judg.get(cand.cargo_id)
+            if not item:
+                continue
+            verdict = str(item.get("verdict") or "").lower()
+            has_basis = bool(
+                str(item.get("source_quote") or "").strip()
+                or item.get("preference_index") is not None
+                or str(item.get("risk_reason") or item.get("risk") or "").strip()
+            )
+            if verdict == "hard_avoid" and not has_basis:
+                verdict = "soft_avoid"  # 无依据的封杀降级(kiki第5条权限规则)
+                self._logger.warning("council hard_avoid缺依据,降级soft_avoid: %s", cand.cargo_id)
+            adj = 0.0
+            try:
+                adj = float(item.get("score_adjustment") or 0.0)
+            except (TypeError, ValueError):
+                adj = 0.0
+            adj = max(-800.0, min(800.0, adj))
+            if verdict == "hard_avoid":
+                cand.legal = False
+                cand.veto_reasons.append("guardian_hard_avoid")
+            elif verdict == "soft_avoid":
+                risk = str(item.get("risk_level") or "medium").lower()
+                cand.llm_adjustment = min(adj, soft_by_risk.get(risk, -200.0))
+            else:  # prefer / allow
+                cand.llm_adjustment = adj
+        return all_candidates
 
     @staticmethod
     def _guardian_downgrade_candidates(candidates: list[CandidateFact], guardian: dict[str, Any]) -> list[CandidateFact]:
@@ -748,6 +1148,37 @@ class ModelDecisionService:
         best_nph = max((c.net_per_hour_before_pref for c in legal), default=0.0)
         return best_net < 400.0 and best_nph < 45.0
 
+    def _monthend_shortfall_targets(self, pref_policy: dict[str, Any], driver_id: str, sim_min: int) -> list[str]:
+        """月末安全广查闸门: 月末7天内仍有欠额的配额品类列表(触发强制扩查+定向种子)。
+        纯日历算术+客观计数,零偏好常量。"""
+        if not FEATURE_FLAGS.get("monthend_scout"):
+            return []
+        try:
+            now = _SIMULATION_EPOCH + timedelta(minutes=sim_min)
+            month_days = ((now.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)).day
+            if month_days - now.day > 7:
+                return []  # 只在月末窗口动用大查询(全月广查曾实测伤隐藏司机)
+            ledger = self._preference_ledger(driver_id)
+            counts = ledger.get("cargo_name_counts_by_month") or {}
+            out = []
+            for t in self._cargo_targets(pref_policy):
+                try:
+                    if int(t.get("month")) != now.month:
+                        continue
+                    need = int(t.get("min_count"))
+                except (TypeError, ValueError):
+                    continue
+                name = str(t.get("cargo_name", "") or "").strip()
+                if not name:
+                    continue
+                used = int((counts.get(f"2026-{now.month:02d}") or {}).get(name, 0) or 0)
+                if need - used > 0:
+                    out.append(name)
+            return out
+        except Exception as e:
+            self._logger.warning("monthend_shortfall failed: %s", e)
+            return []
+
 
 
 
@@ -803,6 +1234,8 @@ class ModelDecisionService:
                         {
                             "id": "cargo id",
                             "verdict": "prefer|allow|soft_avoid|hard_avoid",
+                            "score_adjustment": "integer -800..800, bounded bonus/malus to the deterministic score",
+                            "source_quote": "exact preference text snippet this judgment is based on (required for hard_avoid)",
                             "risk": "brief",
                             "preference_value": "brief",
                         }
@@ -821,11 +1254,21 @@ class ModelDecisionService:
 
 
     def _run_deterministic_market_scout_queries(
-        self, driver_id: str, status: dict[str, Any], first_pass: list[CandidateFact], budget_guard: bool
+        self,
+        driver_id: str,
+        status: dict[str, Any],
+        first_pass: list[CandidateFact],
+        budget_guard: bool,
+        shortfall_cats: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if budget_guard:
             return []
         seeds: list[tuple[float, float, str]] = []
+        # 月末配额欠额时: 种子优先指向该品类历史出现过的观测热点(定向找货,削自然扣分主成分)
+        if shortfall_cats:
+            for point in self._observed_points_by_driver.get(str(status.get("driver_id", "")), []):
+                if str(point.get("cargo_name", "")) in shortfall_cats:
+                    seeds.append((float(point["lat"]), float(point["lng"]), f"shortfall:{point.get('cargo_name')}"))
         for cand in sorted(first_pass, key=lambda c: (c.legal, c.net_yuan_before_pref, c.near_end_cargo_seen), reverse=True)[:4]:
             for key in ("start", "end"):
                 point = self._compact_point(cand.cargo.get(key))
@@ -869,22 +1312,32 @@ class ModelDecisionService:
             ],
             "response_format": {"type": "json_object"},
         }
-        resp = self._api.model_chat_completion(request)
-        choices = resp.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise ValueError(f"{agent_name} missing choices")
-        content = choices[0].get("message", {}).get("content")
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError(f"{agent_name} empty content")
-        data = json.loads(content)
-        if not isinstance(data, dict):
-            raise ValueError(f"{agent_name} did not return object")
-        self._logger.info(
-            "agent_council_json agent=%s data=%s",
-            agent_name,
-            json.dumps(data, ensure_ascii=False, separators=(",", ":")),
-        )
-        return data
+        if FEATURE_FLAGS.get("compile_temperature0"):
+            request["temperature"] = 0  # 同输入同输出,降编译/守护方差(网关拒收时重试分支会去掉)
+        last_err: Exception | None = None
+        for attempt in range(2):  # 单次重试: 容忍偶发坏JSON/网络抖动,仍保留fail-fast精神
+            try:
+                resp = self._api.model_chat_completion(dict(request))
+                choices = resp.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    raise ValueError(f"{agent_name} missing choices")
+                content = choices[0].get("message", {}).get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError(f"{agent_name} empty content")
+                data = json.loads(content)
+                if not isinstance(data, dict):
+                    raise ValueError(f"{agent_name} did not return object")
+                self._logger.info(
+                    "agent_council_json agent=%s data=%s",
+                    agent_name,
+                    json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                )
+                return data
+            except Exception as e:
+                last_err = e
+                request.pop("temperature", None)  # 重试时去掉可选参数,防网关拒收
+                self._logger.warning("agent_json retry agent=%s err=%s", agent_name, e)
+        raise last_err if last_err else ValueError(f"{agent_name} failed")
 
 
     def _build_candidate_facts(
@@ -1150,11 +1603,18 @@ class ModelDecisionService:
             for hour in _covered_clock_hours(int(order["active_start"]), int(order["finish"])):
                 key = f"{hour:02d}:00"
                 active_clock_hours[key] = active_clock_hours.get(key, 0) + 1
+        # 每单原始干线分钟按月列表(供动态阈值长途计数——隐藏司机的阈值可能是任意小时数,
+        # 固定 over_8h 分箱会全口径错配)
+        transport_minutes_by_month: dict[str, list[int]] = {}
+        for order in orders:
+            month = str(order.get("month") or "")
+            transport_minutes_by_month.setdefault(month, []).append(int(order.get("transport_min", 0) or 0))
         return {
             "note": "factual memory of previous LLM-selected orders in this run; use only to interpret visible text preferences",
             "orders_total": len(orders),
             "cargo_name_counts_by_month": name_counts,
             "transport_duration_bins_by_month": transport_duration_bins,
+            "transport_minutes_by_month": transport_minutes_by_month,
             "active_duration_bins_by_month": active_duration_bins,
             "active_clock_hour_counts": active_clock_hours,
         }
@@ -1199,8 +1659,12 @@ class ModelDecisionService:
 
     def _remember_observed_points(self, driver_id: str, items: list[dict[str, Any]]) -> None:
         points = self._observed_points_by_driver.setdefault(driver_id, [])
+        names = self._seen_cargo_names_by_driver.setdefault(driver_id, set())
         for item in items:
             cargo = item.get("cargo") or {}
+            nm = str(cargo.get("cargo_name", "") or "").strip()
+            if nm:
+                names.add(nm)  # 词表累积(audit品类校验/snap对齐用,客观观测零硬编码)
             try:
                 start_lat, start_lng = _cargo_point(cargo, "start")
                 price = _cargo_price_yuan(cargo)
@@ -1208,6 +1672,9 @@ class ModelDecisionService:
                 continue
             if any(_haversine_km(start_lat, start_lng, p["lat"], p["lng"]) < 25 for p in points):
                 continue
-            points.append({"lat": round(start_lat, 4), "lng": round(start_lng, 4), "price": round(price, 1)})
+            entry = {"lat": round(start_lat, 4), "lng": round(start_lng, 4), "price": round(price, 1)}
+            if nm:
+                entry["cargo_name"] = nm  # 供月末定向广查种子(欠额品类历史热点)
+            points.append(entry)
         points.sort(key=lambda p: p["price"], reverse=True)
         del points[20:]
