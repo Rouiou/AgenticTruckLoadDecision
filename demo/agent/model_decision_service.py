@@ -294,6 +294,9 @@ class ModelDecisionService:
                 "数字示例(虚构,仅示意规则): 19:00-05:00 + 晚一个小时再休息 = 20:00-05:00。"
                 "每条约束必须输出 source_quote 字段=依据的偏好原文片段(逐字摘录,供审计回查)。"
                 "若原文暗示但未明说某约束(隐式约束),也要列出并标 low confidence,放入 unknown_constraints。"
+                "unknown_constraints 的 risk_level 严格区分:【需要 agent 采取额外行动才能满足】"
+                "(如每天最多/至少 N 单、每隔 X 天回家、每天在线 X 小时、去某地累计 N 天)填 high;"
+                "只是对【已编译约束】的补充说明(罚款金额/周末定义/比上月罚得重/计数口径)填 low。"
                 "【周期严格匹配】cargo_targets/cargo_max_limits/long_haul_limits 都是【按月】计数的槽位。"
                 "若原文的数量限制是【按天/每天/一天/每日/每周/每隔】等非月度周期,schema 没有对应槽位——"
                 "严禁硬塞进月度槽位(每日2单≠每月2单,塞错会灾难性执行),必须整条放入 unknown_constraints 并注明真实周期。"
@@ -627,6 +630,7 @@ class ModelDecisionService:
                         q = _norm_text(str(e.get("source_quote", "")))
                         if q:
                             cov_quotes.append(q)
+            pref_norms = [_norm_text(str(p.get("content", "")) if isinstance(p, dict) else str(p)) for p in prefs]
             deduped, seen_txt = [], set()
             for u in unknowns:
                 txt = _norm_text(str(u.get("preference_text", "")))
@@ -634,10 +638,19 @@ class ModelDecisionService:
                     continue
                 seen_txt.add(txt)
                 why = str(u.get("why_unsupported", ""))
+                risk = str(u.get("risk_level", "")).lower()
                 # 投票降级条目若回原文找不到依据=单票幻觉(如把长途误编进cargo_max_limits的
                 # long_haul_generic),直接丢弃——不值得为幻觉把全已知司机踢出零LLM快车道
                 if "vote_unstable" in why and txt not in raw_all:
                     self._logger.info("audit丢弃vote幻觉(原文无依据): %s", txt[:80])
+                    continue
+                # 描述性子句剔除: non-high 且是某条偏好原文的【真子串】=对已编译约束的补充说明
+                # (罚款细节/周末定义/比上月重等),不必每步触发Council(治结转期墙钟+token)。
+                # 真未知类型(每日上限/回家/在线时长)是独立完整偏好且标 high,受保护不被剔除。
+                if risk != "high" and "冲突" not in why and "vote_unstable" not in why and any(
+                    txt in pc and txt != pc for pc in pref_norms
+                ):
+                    self._logger.info("audit剔除描述性子句(non-high且是偏好子串): %s", txt[:60])
                     continue
                 covered = any(txt in q or q in txt for q in cov_quotes)
                 # 已被硬执行字段覆盖的=重复条目,一律跳过(含vote降级的重复,如long_haul重复编进
