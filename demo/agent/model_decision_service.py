@@ -35,7 +35,7 @@ FEATURE_FLAGS = {
     "council_v2": True,             # Day2: guardian→Council(top10对齐/±800限幅/must_wait/need_scout)
     "monthend_scout": True,         # Day3: 月末安全广查闸门
     "subgrad_shadow": True,         # Day3: 次梯度影子价格(关=0.12常数)
-    "ltd_reposition": True,         # Day4: 受限reposition(三重闸门)
+    "ltd_reposition": False,         # Day4: 受限reposition(三重闸门)
     "dest_value": False,             # Day4: V落点价值表
 }
 
