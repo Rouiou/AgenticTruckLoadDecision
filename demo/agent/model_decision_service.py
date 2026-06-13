@@ -23,6 +23,10 @@ _DEFAULT_COST_PER_KM = 1.5
 _HORIZON_MINUTES = 92 * 24 * 60
 _TOKEN_SOFT_LIMIT = 4_600_000
 _MAX_WAIT_MINUTES = _HORIZON_MINUTES
+# 每司机 Council(LLM触点#2)调用硬上限——超出走纯确定性 argmax。防 per-step Council 在未知重的
+# 隐藏司机上拖垮复赛4h总时长上限(实测qwen-plus单次~35s、单司机per-step可达~100分钟→必超时)。
+# 主流未知类型(每日上限/回家)已确定性编译化、极少触发Council,本上限只是兜底未预料类型。
+_COUNCIL_CALL_CAP = 40
 
 # ===== K底Z甲 feature flags(形状参数,零偏好常量;全部默认=v19原行为,逐项验证后开启) =====
 FEATURE_FLAGS = {
@@ -190,6 +194,7 @@ class ModelDecisionService:
         # 运行时见过的真实品类名全集(query返回累积,零硬编码)——供编译audit的品类词表校验/snap对齐
         self._seen_cargo_names_by_driver: dict[str, set[str]] = {}
         self._last_reposition_day: dict[str, int] = {}
+        self._council_calls_by_driver: dict[str, int] = {}
 
     def decide(self, driver_id: str) -> dict[str, Any]:
         self._cur_driver_id = driver_id  # 供打分层回查该司机的观测热点(影子价格机会数估计)
@@ -243,7 +248,14 @@ class ModelDecisionService:
             u for u in self._unknown_constraints(pref_policy)
             if str(u.get("risk_level", "")).lower() == "high"
         ]
-        if high_unknowns and candidates:
+        _council_used = self._council_calls_by_driver.get(driver_id, 0)
+        if high_unknowns and candidates and _council_used >= _COUNCIL_CALL_CAP:
+            self._logger.info(
+                "council budget exhausted driver=%s used=%s cap=%s -> 走纯确定性argmax(防超时)",
+                driver_id, _council_used, _COUNCIL_CALL_CAP,
+            )
+        if high_unknowns and candidates and _council_used < _COUNCIL_CALL_CAP:
+            self._council_calls_by_driver[driver_id] = _council_used + 1
             if FEATURE_FLAGS.get("council_v2"):
                 # Council v2: 审【按确定性score排序的top-10】(与argmax对齐,堵"argmax选中
                 # guardian没见过的候选"缺口);未审候选在守护激活时不参与argmax(宁wait不接未审单)
@@ -311,14 +323,16 @@ class ModelDecisionService:
                 "每条约束必须输出 source_quote 字段=依据的偏好原文片段(逐字摘录,供审计回查)。"
                 "若原文暗示但未明说某约束(隐式约束),也要列出并标 low confidence,放入 unknown_constraints。"
                 "unknown_constraints 的 risk_level 严格区分:【需要 agent 采取额外行动才能满足】"
-                "(如每天最多/至少 N 单、每隔 X 天回家、每天在线 X 小时、去某地累计 N 天)填 high;"
+                "(如每天至少 N 单、每隔 X 天回家、每天在线 X 小时、去某地累计 N 天)填 high;"
                 "只是对【已编译约束】的补充说明(罚款金额/周末定义/比上月罚得重/计数口径)填 low。"
                 "【绝对禁止】把已经编进 rest_windows/cargo_targets/long_haul_limits/cargo_max_limits/"
-                "region_avoid 任一字段的偏好,再重复放进 unknown_constraints——那会导致同一约束被"
+                "daily_order_caps/region_avoid 任一字段的偏好,再重复放进 unknown_constraints——那会导致同一约束被"
                 "结构化执行器和守护层重复处理。unknown_constraints 只放【上述字段都无法表达】的偏好。"
                 "【周期严格匹配】cargo_targets/cargo_max_limits/long_haul_limits 都是【按月】计数的槽位。"
-                "若原文的数量限制是【按天/每天/一天/每日/每周/每隔】等非月度周期,schema 没有对应槽位——"
-                "严禁硬塞进月度槽位(每日2单≠每月2单,塞错会灾难性执行),必须整条放入 unknown_constraints 并注明真实周期。"
+                "【每日接单数上限】(每天/一天/每日 最多接 N 单)→ 编进 machine_ir.daily_order_caps(max_per_day=N),"
+                "由确定性执行器按日计数拦截,不要放进月度槽位、也不要放 unknown_constraints。"
+                "其余非月度周期(每天【至少】N单、每周、每隔 X 天回家、到某地累计 N 天 等)schema 无对应槽位——"
+                "严禁硬塞进月度槽位(每日≠每月,塞错会灾难性执行),必须整条放入 unknown_constraints 并注明真实周期。"
                 "若有至少/最多/不得/必须/罚/扣/指标，输出它们的优先级和计数口径。"
                 "若文本提到“上月没完成、欠额、本月补、接着补”，必须结合 preference_ledger 和历史目标语义"
                 "判断欠额来自哪一个旧指标；如果当前文本没有明说旧货类，但历史 policy/ledger 能确定旧货类，"
@@ -390,6 +404,13 @@ class ModelDecisionService:
                                 "cargo_name": "string",
                                 "max_count": "integer",
                                 "penalty_amount": "number if visible",
+                            }
+                        ],
+                        "daily_order_caps": [
+                            {
+                                "max_per_day": "integer (每天/一天/每日 最多接 N 单 → N)",
+                                "penalty_amount": "number if visible",
+                                "source_quote": "exact text",
                             }
                         ],
                         "region_avoid": [{"field": "origin|destination|either", "keyword": "city/province/region text"}],
@@ -643,7 +664,7 @@ class ModelDecisionService:
             # 5) semantic-family unknown 去重: 与已编译约束 source_quote 互为子串的 unknown=重复,删
             cov_quotes = []
             for fld in ("rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits",
-                        "region_avoid", "origin_avoid", "destination_prefer"):
+                        "daily_order_caps", "region_avoid", "origin_avoid", "destination_prefer"):
                 for e in ir.get(fld) or []:
                     if isinstance(e, dict):
                         q = _norm_text(str(e.get("source_quote", "")))
@@ -835,6 +856,17 @@ class ModelDecisionService:
             used = int((ledger.get("cargo_name_counts_by_month") or {}).get(month, {}).get(name, 0) or 0)
             if used >= max_count:
                 vetoes.append("cargo_max_limit_full")
+        for cap in self._daily_order_caps(pref_policy):
+            # 每天最多 N 单: 确定性按日计数拦截(治 Council 每步触发=超时源,且 Council 漏拦~10%)。
+            # day = 订单起始日(与官方按 action_start//1440 计数同口径); 当日已接>=N 则否决第 N+1 单。
+            max_per_day = _optional_int(cap.get("max_per_day"), 999999)
+            if max_per_day <= 0:
+                continue
+            day = active_start // 1440
+            used = int((ledger.get("order_count_by_day") or {}).get(f"day{day}", 0) or 0)
+            if used >= max_per_day:
+                vetoes.append("daily_order_cap_full")
+                break
         if self._matches_region_avoid(cand.cargo, pref_policy):
             vetoes.append("region_avoid")
         return vetoes
@@ -1002,6 +1034,12 @@ class ModelDecisionService:
     def _cargo_max_limits(pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
         ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
         raw = ir.get("cargo_max_limits") if isinstance(ir.get("cargo_max_limits"), list) else []
+        return [x for x in raw if isinstance(x, dict)]
+
+    @staticmethod
+    def _daily_order_caps(pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
+        ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
+        raw = ir.get("daily_order_caps") if isinstance(ir.get("daily_order_caps"), list) else []
         return [x for x in raw if isinstance(x, dict)]
 
     @staticmethod
@@ -1739,6 +1777,7 @@ class ModelDecisionService:
             "active_duration_bins_by_month": active_duration_bins,
             "active_clock_hour_counts": active_clock_hours,
             "orders_per_day_recent": recent_days,
+            "order_count_by_day": day_counts,
             "last_order_start_min": last_take_min,
         }
 
