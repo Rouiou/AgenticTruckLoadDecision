@@ -29,7 +29,7 @@ FEATURE_FLAGS = {
     "compile_temperature0": True,   # Day1: 编译temperature=0+单次重试
     "rest_window_strict": True,     # Day1: 删默认兜底,五条件验证不满足→unknown
     "compile_audit": True,          # Day1: 编译后本地audit九项+冲突剥离+family去重
-    "field_voting": True,           # Day1: 字段级3票(period/数量5票),不一致→降级unknown
+    "field_voting": False,           # Day1: 字段级3票(period/数量5票),不一致→降级unknown
     "dynamic_longhaul": True,       # Day1: ledger存transport_min列表,按limit阈值现算
     "snap_vocab": True,             # Day1: 品类等值snap词表(三处匹配点)
     "council_v2": True,             # Day2: guardian→Council(top10对齐/±800限幅/must_wait/need_scout)
@@ -37,6 +37,7 @@ FEATURE_FLAGS = {
     "subgrad_shadow": True,         # Day3: 次梯度影子价格(关=0.12常数)
     "ltd_reposition": False,         # Day4: 受限reposition(三重闸门)
     "dest_value": False,             # Day4: V落点价值表
+    "aggressive_fulfill": False,     # 实验: 激进履约(配速驱动)——落后线性配速即λ→1抢配额+提早定向广查;默认关=保守K底Z甲
 }
 
 
@@ -891,6 +892,12 @@ class ModelDecisionService:
                 )
                 est_chances = max(1.0, float(seen_pts) * days_left / 4.0)
                 lam = min(1.0, shortfall / est_chances)
+                if FEATURE_FLAGS.get("aggressive_fulfill"):
+                    # 激进履约: 落后线性配速即视为紧迫(λ→1),提早抢配额而非赌后续机会。
+                    # bonus仍按penalty比例(不超配额经济价值)、且只加分不veto——作息/上限veto在上游,激进抢单越不过作息防线。
+                    nowdt = _SIMULATION_EPOCH + timedelta(minutes=sim_min)
+                    if month != now_month or used * self._days_in_month(nowdt) < min_count * nowdt.day:
+                        lam = 1.0
                 bonus += penalty * (1.0 + lam * shortfall) * days_left_factor
             else:
                 bonus += (penalty + 0.12 * penalty * shortfall) * days_left_factor
@@ -1242,16 +1249,22 @@ class ModelDecisionService:
         best_nph = max((c.net_per_hour_before_pref for c in legal), default=0.0)
         return best_net < 400.0 and best_nph < 45.0
 
+    @staticmethod
+    def _days_in_month(dt: datetime) -> int:
+        return ((dt.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)).day
+
     def _monthend_shortfall_targets(self, pref_policy: dict[str, Any], driver_id: str, sim_min: int) -> list[str]:
-        """月末安全广查闸门: 月末7天内仍有欠额的配额品类列表(触发强制扩查+定向种子)。
-        纯日历算术+客观计数,零偏好常量。"""
+        """配额欠额定向广查闸门。保守(默认): 仅月末7天内仍欠额的配额品类→触发强制扩查+定向种子。
+        激进(aggressive_fulfill): 落后线性配速即提早触发,不再死等月末。纯日历算术+客观计数,零偏好常量。"""
         if not FEATURE_FLAGS.get("monthend_scout"):
             return []
         try:
             now = _SIMULATION_EPOCH + timedelta(minutes=sim_min)
-            month_days = ((now.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)).day
-            if month_days - now.day > 7:
-                return []  # 只在月末窗口动用大查询(全月广查曾实测伤隐藏司机)
+            month_days = self._days_in_month(now)
+            days_left = month_days - now.day
+            aggressive = bool(FEATURE_FLAGS.get("aggressive_fulfill"))
+            if days_left > 7 and not aggressive:
+                return []  # 保守: 只在月末窗口动用大查询(全月广查曾实测伤隐藏司机)
             ledger = self._preference_ledger(driver_id)
             counts = ledger.get("cargo_name_counts_by_month") or {}
             out = []
@@ -1266,7 +1279,10 @@ class ModelDecisionService:
                 if not name:
                     continue
                 used = int((counts.get(f"2026-{now.month:02d}") or {}).get(name, 0) or 0)
-                if need - used > 0:
+                if need - used <= 0:
+                    continue
+                # 月末7天=安全网无条件; 激进额外: 落后线性配速(used*月天数 < need*当前日)即提早定向找货
+                if days_left <= 7 or (aggressive and used * month_days < need * now.day):
                     out.append(name)
             return out
         except Exception as e:
