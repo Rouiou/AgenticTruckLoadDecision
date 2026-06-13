@@ -104,8 +104,16 @@ def _cargo_price_yuan(cargo: dict[str, Any]) -> float:
     return float(cargo.get("price", 0.0) or 0.0)
 
 
+_PUNCT = "，。；：、！？「」『』“”‘’（）()【】《》—-…·,.;:!?\"'"
+
+
 def _norm_text(s: str) -> str:
-    return "".join(str(s).split())
+    # 去空格+去中英文标点: LLM 摘录 source_quote/preference_text 时常省略或改写标点,
+    # 子串匹配必须标点无关(否则"没完成，五月"vs"没完成五月"误判为不匹配)。
+    out = "".join(str(s).split())
+    for ch in _PUNCT:
+        out = out.replace(ch, "")
+    return out
 
 
 def _snap_category(kw: str, known: set[str]) -> tuple[str, str]:
@@ -631,6 +639,20 @@ class ModelDecisionService:
                         if q:
                             cov_quotes.append(q)
             pref_norms = [_norm_text(str(p.get("content", "")) if isinstance(p, dict) else str(p)) for p in prefs]
+            # 【配额型偏好原文】(产出了 cargo_target/cargo_max 的那条 pref)：其配额已由确定性
+            # 影子价格+makeup结转履约,该 pref 的所有 unknown 子句(含"补欠额/罚得比上月重"等
+            # 结转描述,即使LLM标high)都是配额的附属说明,全部剔除——否则结转期每步触发Council、
+            # 墙钟逼近上限(实测公开司机5月单跑25分钟未完)。判据=pref含某配额品类名(鲁棒,不依赖
+            # source_quote);作息pref不含配额品类名,其混入的真未知(如"每隔X天回家")不受影响。
+            quota_names = [
+                str(t.get("cargo_name", "") or "").strip()
+                for fld in ("cargo_targets", "cargo_max_limits")
+                for t in (ir.get(fld) or []) if isinstance(t, dict)
+            ]
+            quota_prefs = [
+                pc for pc in pref_norms
+                if any(nm and nm in pc for nm in quota_names)
+            ]
             deduped, seen_txt = [], set()
             for u in unknowns:
                 txt = _norm_text(str(u.get("preference_text", "")))
@@ -643,6 +665,12 @@ class ModelDecisionService:
                 # long_haul_generic),直接丢弃——不值得为幻觉把全已知司机踢出零LLM快车道
                 if "vote_unstable" in why and txt not in raw_all:
                     self._logger.info("audit丢弃vote幻觉(原文无依据): %s", txt[:80])
+                    continue
+                # 配额型pref的unknown子句(含结转high)全剔除——配额已确定性履约,不必每步Council
+                if "冲突" not in why and "vote_unstable" not in why and any(
+                    txt in qp for qp in quota_prefs
+                ):
+                    self._logger.info("audit剔除配额附属子句(配额已确定性履约): %s", txt[:60])
                     continue
                 # 描述性子句剔除: non-high 且是某条偏好原文的【真子串】=对已编译约束的补充说明
                 # (罚款细节/周末定义/比上月重等),不必每步触发Council(治结转期墙钟+token)。
