@@ -235,7 +235,14 @@ class ModelDecisionService:
             "candidate_facts_json data=%s",
             json.dumps([self._candidate_prompt(c) for c in candidates], ensure_ascii=False, separators=(",", ":")),
         )
-        if self._unknown_constraints(pref_policy) and candidates:
+        # 仅【high risk 未知约束】触发 Council——high=需要 agent 额外行动才能满足(每日量/回家/
+        # 在线时长/区域累计);low/medium=对已编译约束的描述补充(罚款金额/计数口径),不必每步调
+        # Council(治墙钟+token:全描述性 unknown 的司机走零LLM快车道)。比文本子串匹配鲁棒。
+        high_unknowns = [
+            u for u in self._unknown_constraints(pref_policy)
+            if str(u.get("risk_level", "")).lower() == "high"
+        ]
+        if high_unknowns and candidates:
             if FEATURE_FLAGS.get("council_v2"):
                 # Council v2: 审【按确定性score排序的top-10】(与argmax对齐,堵"argmax选中
                 # guardian没见过的候选"缺口);未审候选在守护激活时不参与argmax(宁wait不接未审单)
@@ -305,6 +312,9 @@ class ModelDecisionService:
                 "unknown_constraints 的 risk_level 严格区分:【需要 agent 采取额外行动才能满足】"
                 "(如每天最多/至少 N 单、每隔 X 天回家、每天在线 X 小时、去某地累计 N 天)填 high;"
                 "只是对【已编译约束】的补充说明(罚款金额/周末定义/比上月罚得重/计数口径)填 low。"
+                "【绝对禁止】把已经编进 rest_windows/cargo_targets/long_haul_limits/cargo_max_limits/"
+                "region_avoid 任一字段的偏好,再重复放进 unknown_constraints——那会导致同一约束被"
+                "结构化执行器和守护层重复处理。unknown_constraints 只放【上述字段都无法表达】的偏好。"
                 "【周期严格匹配】cargo_targets/cargo_max_limits/long_haul_limits 都是【按月】计数的槽位。"
                 "若原文的数量限制是【按天/每天/一天/每日/每周/每隔】等非月度周期,schema 没有对应槽位——"
                 "严禁硬塞进月度槽位(每日2单≠每月2单,塞错会灾难性执行),必须整条放入 unknown_constraints 并注明真实周期。"
@@ -660,6 +670,7 @@ class ModelDecisionService:
                     continue
                 seen_txt.add(txt)
                 why = str(u.get("why_unsupported", ""))
+                why_l = why.lower()
                 risk = str(u.get("risk_level", "")).lower()
                 # 投票降级条目若回原文找不到依据=单票幻觉(如把长途误编进cargo_max_limits的
                 # long_haul_generic),直接丢弃——不值得为幻觉把全已知司机踢出零LLM快车道
@@ -671,6 +682,25 @@ class ModelDecisionService:
                     txt in qp for qp in quota_prefs
                 ):
                     self._logger.info("audit剔除配额附属子句(配额已确定性履约): %s", txt[:60])
+                    continue
+                # 结转语义剔除(概念词,比文本子串鲁棒): 跨月补欠额已由 makeup_targets+影子价格
+                # 确定性处理,该司机有配额目标时,任何"补欠/没完成/接着补/makeup/deficit"类 unknown
+                # 都是结转描述,剔除。无配额目标的司机(DG8/回家)不含这些词,不受影响。
+                _ct = txt + why_l if (txt or why_l) else ""
+                if quota_names and "冲突" not in why and "vote_unstable" not in why and any(
+                    w in _ct for w in ("接着补", "欠的单", "没完成", "补上月", "补欠",
+                                       "makeup", "deficit", "carryover", "carry over", "previousmonth")
+                ):
+                    self._logger.info("audit剔除结转语义(makeup已确定性处理): %s", (txt or why)[:50])
+                    continue
+                # LLM自认冗余: why 表明该约束【已被结构化字段覆盖】(如"covered by rest_windows
+                # logic"/"recurring"),却仍放进unknown——是重复,剔除(治作息整条原文被重复放unknown)。
+                # 真未知(每日上限/回家)的why是"schema无槽位/daily≠monthly/no slot",不含已覆盖语义。
+                if "vote_unstable" not in why and "冲突" not in why and any(
+                    w in why_l for w in ("covered", "handled by", "structurally", "recurring",
+                                         "already captured", "already represented", "已覆盖", "已编")
+                ) and any(txt in pc for pc in pref_norms):
+                    self._logger.info("audit剔除LLM自认冗余(why表明已覆盖): %s", txt[:60])
                     continue
                 # 描述性子句剔除: non-high 且是某条偏好原文的【真子串】=对已编译约束的补充说明
                 # (罚款细节/周末定义/比上月重等),不必每步触发Council(治结转期墙钟+token)。
