@@ -428,12 +428,16 @@ class ModelDecisionService:
                 ensure_ascii=False, sort_keys=True,
             )
 
-        ir_lists = ["rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits",
-                    "region_avoid", "origin_avoid", "destination_prefer", "region_min_targets",
-                    "date_or_weekday_rules", "makeup_targets"]
+        # 【硬执行字段】(有确定性执行器,投票不稳定→降级unknown交守护:错编会真违规):
+        hard_fields = ["rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits",
+                       "region_avoid", "origin_avoid"]
+        # 【软/无执行字段】(date_or_weekday_rules等在v19无执行器,destination_prefer/makeup另路处理):
+        # 投票不稳定时取多数票即可、绝不降级unknown——否则冗余字段抖动会把【全已知司机】踢出
+        # 零LLM快车道、每步触发Council(公开司机实测token 9k→742k/79倍)。
+        soft_fields = ["destination_prefer", "region_min_targets", "date_or_weekday_rules", "makeup_targets"]
         base_ir = base.get("machine_ir") if isinstance(base.get("machine_ir"), dict) else {}
         demoted: list[dict[str, Any]] = []
-        for fld in ir_lists:
+        for fld in hard_fields + soft_fields:
             counts: dict[str, int] = {}
             first: dict[str, dict[str, Any]] = {}
             for v in votes:
@@ -449,6 +453,8 @@ class ModelDecisionService:
                     counts[s] = counts.get(s, 0) + 1
                     first.setdefault(s, e)
             base_ir[fld] = [first[s] for s, c in counts.items() if c >= 2]
+            if fld in soft_fields:
+                continue  # 软字段不降级(无执行器,抖动无害,降级只会无谓触发Council)
             for s, c in counts.items():
                 if c < 2:
                     e = first[s]
@@ -628,9 +634,16 @@ class ModelDecisionService:
                     continue
                 seen_txt.add(txt)
                 why = str(u.get("why_unsupported", ""))
+                # 投票降级条目若回原文找不到依据=单票幻觉(如把长途误编进cargo_max_limits的
+                # long_haul_generic),直接丢弃——不值得为幻觉把全已知司机踢出零LLM快车道
+                if "vote_unstable" in why and txt not in raw_all:
+                    self._logger.info("audit丢弃vote幻觉(原文无依据): %s", txt[:80])
+                    continue
                 covered = any(txt in q or q in txt for q in cov_quotes)
-                if covered and "other" not in why and "vote_unstable" not in why and "冲突" not in why:
-                    continue  # 已有executor覆盖的重复条目(kiki#5);投票降级/冲突剥离的保留
+                # 已被硬执行字段覆盖的=重复条目,一律跳过(含vote降级的重复,如long_haul重复编进
+                # cargo_max_limits);仅"冲突剥离"和"other兜底"必须保留交Council。
+                if covered and "other" not in why and "冲突" not in why:
+                    continue
                 deduped.append(u)
             ir["unknown_constraints"] = deduped
             policy["machine_ir"] = ir
