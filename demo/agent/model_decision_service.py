@@ -23,6 +23,7 @@ _DEFAULT_COST_PER_KM = 1.5
 _HORIZON_MINUTES = 92 * 24 * 60
 _TOKEN_SOFT_LIMIT = 4_600_000
 _MAX_WAIT_MINUTES = _HORIZON_MINUTES
+_PRE_QUERY_SAFETY_MIN = 5  # 通用安全余量: 查货扫描预估耗时之外再留几分钟,防扫描尾巴擦进禁动窗头
 
 # ===== K底Z甲 feature flags(形状参数,零偏好常量;全部默认=v19原行为,逐项验证后开启) =====
 FEATURE_FLAGS = {
@@ -35,6 +36,7 @@ FEATURE_FLAGS = {
     "council_v2": True,             # Day2: guardian→Council(top10对齐/±800限幅/must_wait/need_scout)
     "monthend_scout": True,         # Day3: 月末安全广查闸门
     "subgrad_shadow": True,         # Day3: 次梯度影子价格(关=0.12常数)
+    "pre_query_rest_guard": True,   # P0-3: 查货前若扫描会跨进禁动窗头→提前wait睡穿(防作息禁动型漏罚)
     "ltd_reposition": False,         # Day4: 受限reposition(三重闸门)
     "dest_value": False,             # Day4: V落点价值表
     "aggressive_fulfill": False,     # 实验: 激进履约(配速驱动)——落后线性配速即λ→1抢配额+提早定向广查;默认关=保守K底Z甲
@@ -220,6 +222,14 @@ class ModelDecisionService:
                 action,
             )
             return action
+
+        pre_q_wait = self._pre_query_rest_guard(status, pref_policy, budget_guard)
+        if pre_q_wait is not None:
+            self._logger.info(
+                "deterministic pre-query rest guard driver=%s sim_min=%s wait=%s (睡穿,防扫描跨进禁动窗头)",
+                driver_id, status.get("simulation_progress_minutes"), pre_q_wait,
+            )
+            return {"action": "wait", "params": {"duration_minutes": pre_q_wait}}
 
         items = self._observe_current_market(driver_id, status, budget_guard)
         status_after_query = self._api.get_driver_status(driver_id)
@@ -999,6 +1009,38 @@ class ModelDecisionService:
                 intervals.append((s, e))
         intervals.sort()
         return intervals
+
+    def _merge_no_go_segments(self, start_min: int, end_min: int, pref_policy: dict[str, Any]) -> list[tuple[int, int]]:
+        """§9.4: 当日"禁动区间"并集→合并相邻/重叠窗成连续禁动段,睡穿时睡到段的【真正末端】
+        (而非单个窗的末端),防"睡到A窗尾紧接着违反相邻B窗"。当前并集源=作息禁动窗;
+        回家门禁型(home-quiet)落地后在此并入(同一并集口径)。"""
+        raw = self._rest_intervals_around(start_min, end_min, pref_policy)
+        if not raw:
+            return []
+        raw.sort()
+        merged: list[tuple[int, int]] = []
+        for s, e in raw:
+            if merged and s <= merged[-1][1]:  # 重叠或相接→合并
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        return merged
+
+    def _pre_query_rest_guard(self, status: dict[str, Any], pref_policy: dict[str, Any], budget_guard: bool) -> int | None:
+        """P0-3: query_cargo 会推进 ceil(返回条数/10)≤ceil(k/10) 仿真分钟。若此刻距下一禁动段段头
+        ≤ 预估扫描(按 k 取保守上界)+ 安全余量,扫描尾巴会擦进窗头→wait 覆盖不到窗头→作息禁动型
+        漏罚(尤其"时段不接单不空驶"型要求窗内全 wait 覆盖)。故查货前提前 wait 睡穿到禁动段真正末端(§9.4),
+        不让查货跨进窗。仅当①此刻不在窗内(在窗内由 _current_rest_wait_minutes 处理)且②扫描会跨窗头
+        时触发;无作息窗司机 no-op(_rest_intervals_around 返回空)。"""
+        if not FEATURE_FLAGS.get("pre_query_rest_guard"):
+            return None
+        sim_min = int(status.get("simulation_progress_minutes", 0) or 0)
+        estimated_scan = math.ceil((120 if budget_guard else 220) / 10)
+        reach = sim_min + estimated_scan + _PRE_QUERY_SAFETY_MIN
+        for start, end in self._merge_no_go_segments(sim_min, sim_min + 24 * 60, pref_policy):
+            if sim_min < start <= reach:
+                return max(1, min(_MAX_WAIT_MINUTES, end - sim_min))  # 睡穿到禁动段末端
+        return None
 
     def _rest_windows(self, pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
         ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
