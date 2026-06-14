@@ -266,7 +266,9 @@ class ModelDecisionService:
                 guardian = self._preference_guardian_council(
                     status_after_query, recent, review_set, cumulative_tokens, pref_policy
                 )
-                all_candidates = self._apply_council_judgments(all_candidates, review_set, guardian)
+                all_candidates = self._apply_council_judgments(
+                    all_candidates, review_set, guardian, driver_id=driver_id, sim_min=sim_min_now
+                )
                 mw = guardian.get("must_wait")
                 if mw is True:
                     rw = _optional_int(guardian.get("recommended_wait_minutes"), 120)
@@ -1063,14 +1065,35 @@ class ModelDecisionService:
         raw = ir.get("off_day_requirements") if isinstance(ir.get("off_day_requirements"), list) else []
         return [x for x in raw if isinstance(x, dict)]
 
+    def _active_day_set(self, driver_id: str) -> set[int]:
+        """活动天集合(activity-interval 口径,对齐官方 _active_minutes_by_day): 任一已选单的
+        [active_start, finish] 与某日历日有交集 → 该日有活动。这修正了 order_count_by_day 仅按
+        【起始日】计数的口径错配——跨夜单的运行时间溢入次日(乃至跨月)本是次日活动,旧口径却把
+        次日误判为整歇(official 按分钟逐日累计,会算到次日)。day-index 自带月份,跨月自动归位。
+        (reposition 关→活动仅 take_order;若日后开 ltd_reposition,须在此并入 reposition 区间。)"""
+        days: set[int] = set()
+        for order in self._chosen_orders_by_driver.get(driver_id, []):
+            try:
+                start = int(order.get("active_start", 0))
+                end = int(order.get("finish", 0))
+            except (TypeError, ValueError):
+                continue
+            if end <= start:
+                end = start + 1
+            d = start // 1440
+            while d * 1440 < end:
+                days.add(d)
+                d += 1
+        return days
+
     def _off_days_taken(self, driver_id: str, sim_min: int) -> int:
-        """本月已取得的整天歇车数 = 过去日(不含今天)中接单数为0的天(reposition关→无接单即活动0)。"""
-        counts = (self._preference_ledger(driver_id).get("order_count_by_day") or {})
+        """本月已取得的整天歇车数 = 过去日(不含今天)中【无任何 activity_interval 交集】的天。"""
+        active = self._active_day_set(driver_id)
         now = _SIMULATION_EPOCH + timedelta(minutes=sim_min)
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         start_day = int((month_start - _SIMULATION_EPOCH).total_seconds() // 60) // 1440
         today = sim_min // 1440
-        return sum(1 for d in range(start_day, today) if int(counts.get(f"day{d}", 0) or 0) == 0)
+        return sum(1 for d in range(start_day, today) if d not in active)
 
     def _forced_off_day_wait(self, driver_id: str, status: dict[str, Any], pref_policy: dict[str, Any]) -> int | None:
         """每月至少N整天不出车: 月末逼近(剩余天数 <= 还需off天数+1缓冲)且今天还没接单时,
@@ -1080,11 +1103,16 @@ class ModelDecisionService:
             return None
         sim_min = int(status.get("simulation_progress_minutes", 0) or 0)
         now = _SIMULATION_EPOCH + timedelta(minutes=sim_min)
-        days_left = self._days_in_month(now) - now.day + 1  # 含今天的本月剩余天数
+        # 含今天的本月剩余天数,但夹到【仿真实际剩余天数】: 官方 off-day 统计窗按 simulation_duration_days
+        # 取 days,末月/短horizon时日历整月剩余会高估→按日历推迟到月末才强制→horizon内永不触发=漏歇。
+        # 复赛92天=3个完整日历月,二者恒等(本夹钳为no-op);仅对短horizon收紧,且只会更早强制,绝不漏罚。
+        cal_days_left = self._days_in_month(now) - now.day + 1
+        remaining_sim_days = max(1, -(-(_HORIZON_MINUTES - sim_min) // 1440))  # ceil 含今天
+        days_left = min(cal_days_left, remaining_sim_days)
         taken = self._off_days_taken(driver_id, sim_min)
         today = sim_min // 1440
-        counts = (self._preference_ledger(driver_id).get("order_count_by_day") or {})
-        today_orders = int(counts.get(f"day{today}", 0) or 0)
+        # 今天是否仍"干净"(可被强制为整歇)= 今日无 activity_interval 交集(含昨日跨夜单溢入)。
+        today_clean = today not in self._active_day_set(driver_id)
         for req in reqs:
             try:
                 need = int(req.get("min_off_days"))
@@ -1093,7 +1121,7 @@ class ModelDecisionService:
             still = need - taken
             if still <= 0:
                 continue
-            if days_left <= still + 1 and today_orders == 0:
+            if days_left <= still + 1 and today_clean:
                 return max(1, 1440 - (sim_min % 1440))  # 歇到今日结束=整天off
         return None
 
@@ -1110,11 +1138,14 @@ class ModelDecisionService:
         return [x for x in raw if isinstance(x, dict)]
 
     def _apply_council_judgments(
-        self, all_candidates: list[CandidateFact], review_set: list[CandidateFact], guardian: dict[str, Any]
+        self, all_candidates: list[CandidateFact], review_set: list[CandidateFact], guardian: dict[str, Any],
+        driver_id: str = "", sim_min: int = 0,
     ) -> list[CandidateFact]:
         """Council v2 判定应用(权限有界): hard_avoid须带依据(source_quote/preference_index/
         risk_reason),缺依据自动降级soft_avoid; soft_avoid按风险分级调分(low-80/medium-200/
-        high-500); score_adjustment限幅±800; 未审候选在守护激活时不参与argmax。LLM调分,代码裁决。"""
+        high-500); score_adjustment限幅±800; 未审候选在守护激活时不参与argmax。LLM调分,代码裁决。
+        P0-1 埋点: 每条判定纯日志记录(不写外部文件),四步执行器做完后若扣分仍卡,据此看
+        Council 还在挡什么规则=还剩什么类型该确定性化(零行为改动)。"""
         judg: dict[str, dict[str, Any]] = {}
         for item in guardian.get("candidate_judgments") or []:
             if isinstance(item, dict) and str(item.get("id") or "").strip():
@@ -1145,6 +1176,21 @@ class ModelDecisionService:
             except (TypeError, ValueError):
                 adj = 0.0
             adj = max(-800.0, min(800.0, adj))
+            self._logger.info(
+                "council_judgment data=%s",
+                json.dumps({
+                    "event": "council_judgment",
+                    "driver_id": driver_id,
+                    "sim_min": sim_min,
+                    "cargo_id": cand.cargo_id,
+                    "verdict": verdict,
+                    "source_quote": str(item.get("source_quote") or ""),
+                    "preference_index": item.get("preference_index"),
+                    "risk_reason": str(item.get("risk_reason") or item.get("risk") or ""),
+                    "risk_level": str(item.get("risk_level") or ""),
+                    "score_adjustment": adj,
+                }, ensure_ascii=False, separators=(",", ":")),
+            )
             if verdict == "hard_avoid":
                 cand.legal = False
                 cand.veto_reasons.append("guardian_hard_avoid")
