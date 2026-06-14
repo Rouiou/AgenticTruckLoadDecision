@@ -24,6 +24,10 @@ _HORIZON_MINUTES = 92 * 24 * 60
 _TOKEN_SOFT_LIMIT = 4_600_000
 _MAX_WAIT_MINUTES = _HORIZON_MINUTES
 _PRE_QUERY_SAFETY_MIN = 5  # 通用安全余量: 查货扫描预估耗时之外再留几分钟,防扫描尾巴擦进禁动窗头
+_VISIT_DEFAULT_RADIUS_KM = 3.0   # 通用默认: 文本未给半径时,坐标版"进点才算到达"的小半径
+_VISIT_SCOUT_KM = 120.0          # 通用外圈: 距目标此距离内仅弱引导/定向scout,绝不当达标(红线)
+_VISIT_WEAK_BONUS = 150.0        # 通用弱引导分值(远小于真达标bonus,且不计入visit计数)
+_VISIT_MONTHEND_BUFFER_DAYS = 2  # 通用缓冲: 月末强化真达标候选的剩余天数阈值
 
 # ===== K底Z甲 feature flags(形状参数,零偏好常量;全部默认=v19原行为,逐项验证后开启) =====
 FEATURE_FLAGS = {
@@ -37,6 +41,8 @@ FEATURE_FLAGS = {
     "monthend_scout": True,         # Day3: 月末安全广查闸门
     "subgrad_shadow": True,         # Day3: 次梯度影子价格(关=0.12常数)
     "pre_query_rest_guard": True,   # P0-3: 查货前若扫描会跨进禁动窗头→提前wait睡穿(防作息禁动型漏罚)
+    "location_visit": True,         # 目标点打卡执行器(getter+visit_days按天去重+真达标bonus);死字段补全
+    "recompile_stable_merge": True, # 跨月重编译保护: 稳定约束字段(作息/整歇/区域/长途/打卡)只增不减,防重编译非确定丢窗
     "ltd_reposition": False,         # Day4: 受限reposition(三重闸门)
     "dest_value": False,             # Day4: V落点价值表
     "aggressive_fulfill": False,     # 实验: 激进履约(配速驱动)——落后线性配速即λ→1抢配额+提早定向广查;默认关=保守K底Z甲
@@ -336,17 +342,21 @@ class ModelDecisionService:
                 "每条约束必须输出 source_quote 字段=依据的偏好原文片段(逐字摘录,供审计回查)。"
                 "若原文暗示但未明说某约束(隐式约束),也要列出并标 low confidence,放入 unknown_constraints。"
                 "unknown_constraints 的 risk_level 严格区分:【需要 agent 采取额外行动才能满足】"
-                "(如每天至少 N 单、每隔 X 天回家、每天在线 X 小时、去某地累计 N 天)填 high;"
+                "(如每天至少 N 单、每隔 X 天回家、每天在线 X 小时)填 high;"
                 "只是对【已编译约束】的补充说明(罚款金额/周末定义/比上月罚得重/计数口径)填 low。"
                 "【绝对禁止】把已经编进 rest_windows/cargo_targets/long_haul_limits/cargo_max_limits/"
-                "daily_order_caps/off_day_requirements/region_avoid 任一字段的偏好,再重复放进 unknown_constraints——那会导致同一约束被"
+                "daily_order_caps/off_day_requirements/location_visit_targets/region_avoid 任一字段的偏好,再重复放进 unknown_constraints——那会导致同一约束被"
                 "结构化执行器和守护层重复处理。unknown_constraints 只放【上述字段都无法表达】的偏好。"
                 "【周期严格匹配】cargo_targets/cargo_max_limits/long_haul_limits 都是【按月】计数的槽位。"
                 "【每日接单数上限】(每天/一天/每日 最多接 N 单)→ 编进 machine_ir.daily_order_caps(max_per_day=N),"
                 "由确定性执行器按日计数拦截,不要放进月度槽位、也不要放 unknown_constraints。"
                 "【整天歇车】(每月至少N整天不出车/歇车/完全不出工/那天别排活的整天) → 编进 "
                 "machine_ir.off_day_requirements(min_off_days=N),由确定性执行器月末预留整天,不要放 unknown_constraints。"
-                "其余非月度周期(每天【至少】N单、每周、每隔 X 天回家、到某地累计 N 天 等)schema 无对应槽位——"
+                "【每月至少N天到达目标点】(到某地累计/打卡/每月至少N天去某固定地点或坐标) → 编进 "
+                "machine_ir.location_visit_targets: 文本给经纬度→填 target_lat/target_lng(radius_km 未给则留空,执行层补通用默认);"
+                "文本只给地名→填 keyword(留空 target_lat/target_lng); min_days=该月需到达的不同【天】数(按天去重,非次数);"
+                "month=计分归属月。由确定性执行器逐月按天打卡+月末兜底导向,不要放 unknown_constraints、也不要塞进 cargo_targets(那是按品类计数)。"
+                "其余非月度周期(每天【至少】N单、每周、每隔 X 天回家 等)schema 无对应槽位——"
                 "严禁硬塞进月度槽位(每日≠每月,塞错会灾难性执行),必须整条放入 unknown_constraints 并注明真实周期。"
                 "若有至少/最多/不得/必须/罚/扣/指标，输出它们的优先级和计数口径。"
                 "若文本提到“上月没完成、欠额、本月补、接着补”，必须结合 preference_ledger 和历史目标语义"
@@ -435,6 +445,18 @@ class ModelDecisionService:
                                 "source_quote": "exact text",
                             }
                         ],
+                        "location_visit_targets": [
+                            {
+                                "month": "1..12 integer (计分归属月)",
+                                "min_days": "integer (该月需到达目标点的不同天数, 按天去重非次数)",
+                                "target_lat": "latitude number if text gives coordinates, else null",
+                                "target_lng": "longitude number if text gives coordinates, else null",
+                                "radius_km": "number if visible, else null (执行层补通用默认小半径)",
+                                "keyword": "location/region text if only place name given, else null",
+                                "penalty_amount": "number if visible (整月不满足一次性罚额)",
+                                "source_quote": "exact text",
+                            }
+                        ],
                         "region_avoid": [{"field": "origin|destination|either", "keyword": "city/province/region text"}],
                         "origin_avoid": [{"keyword": "city/province/region text"}],
                         "destination_prefer": [{"keyword": "city/province/region text", "bonus": "number or null"}],
@@ -455,6 +477,7 @@ class ModelDecisionService:
             },
         )
         policy = self._audit_policy(driver_id, policy, prefs)
+        policy = self._merge_stable_fields_from_prior(driver_id, policy)
         policy = self._merge_preference_target_memory(driver_id, policy, prefs)
         policy["_signature"] = signature
         self._preference_policy_by_driver[driver_id] = policy
@@ -465,7 +488,41 @@ class ModelDecisionService:
         )
         return policy
 
+    def _merge_stable_fields_from_prior(self, driver_id: str, policy: dict[str, Any]) -> dict[str, Any]:
+        """跨月重编译保护(治非确定丢窗): 偏好按月增长(夜休→+某月配额→…)会触发整月重编译,而重编译是
+        LLM 调用、非确定——实测某次重编译丢了 weekend 作息窗→周末夜无窗→跨夜单漏罚。作息/整歇/区域/长途/
+        打卡这些【稳定约束】month-to-month 文本不变,不该被重编译丢失。故把上次已验证 policy 里这些字段中、
+        本次缺失的条目【并回】(按签名去重,只增不减),绝不让重编译丢掉已确认的硬约束。配额型(cargo_targets/
+        cargo_max_limits)月月变,不在此列,由 target_memory 另行结转。"""
+        if not FEATURE_FLAGS.get("recompile_stable_merge"):
+            return policy
+        prior = self._preference_policy_by_driver.get(driver_id)
+        nir = policy.get("machine_ir") if isinstance(policy.get("machine_ir"), dict) else None
+        pir = prior.get("machine_ir") if isinstance(prior, dict) and isinstance(prior.get("machine_ir"), dict) else None
+        if pir is None or nir is None:
+            return policy
+        stable = ("rest_windows", "off_day_requirements", "region_avoid", "origin_avoid",
+                  "long_haul_limits", "daily_order_caps", "location_visit_targets")
+        cosmetic = {"label", "source_quote", "penalty_amount", "penalty_cap"}
 
+        def fsig(e: dict[str, Any]) -> str:  # 功能签名(去掉 label/罚额/quote 等易抖动的装饰字段)
+            return json.dumps({k: v for k, v in e.items() if k not in cosmetic}, ensure_ascii=False, sort_keys=True)
+
+        for fld in stable:
+            new_list = [e for e in (nir.get(fld) or []) if isinstance(e, dict)]
+            old_list = [e for e in (pir.get(fld) or []) if isinstance(e, dict)]
+            if not old_list:
+                continue
+            seen = {fsig(e) for e in new_list}
+            restored = list(new_list)
+            for e in old_list:
+                if fsig(e) not in seen:
+                    restored.append(e)
+                    self._logger.warning(
+                        "recompile_stable_merge 并回 %s(本次重编译丢失,从上次policy恢复): %s", fld, fsig(e)[:140]
+                    )
+            nir[fld] = restored
+        return policy
 
     def _compile_once_or_vote(self, agent_name: str, system: str, payload: dict[str, Any]) -> dict[str, Any]:
         """编译调用。field_voting 开启时同 prompt 独立跑 3 次,对 machine_ir 各列表字段做
@@ -495,7 +552,7 @@ class ModelDecisionService:
 
         # 【硬执行字段】(有确定性执行器,投票不稳定→降级unknown交守护:错编会真违规):
         hard_fields = ["rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits",
-                       "region_avoid", "origin_avoid"]
+                       "location_visit_targets", "region_avoid", "origin_avoid"]
         # 【软/无执行字段】(date_or_weekday_rules等在v19无执行器,destination_prefer/makeup另路处理):
         # 投票不稳定时取多数票即可、绝不降级unknown——否则冗余字段抖动会把【全已知司机】踢出
         # 零LLM快车道、每步触发Council(公开司机实测token 9k→742k/79倍)。
@@ -683,10 +740,65 @@ class ModelDecisionService:
                     kept.append(r)
                 ir[fld] = kept
 
+            # 4b) location_visit_targets(目标点打卡): month/min_days正整数 + 坐标对成套或keyword
+            #     二选一锚点 + radius缺省补 + quote回找。无任何锚点(坐标地名都没有)→降级 high unknown 交守护(§9.7)。
+            kept = []
+            for t in ir.get("location_visit_targets") or []:
+                if not isinstance(t, dict):
+                    continue
+                try:
+                    mon, md = int(t.get("month")), int(t.get("min_days"))
+                except (TypeError, ValueError):
+                    demote(t, "location_visit_targets month/min_days非整数")
+                    continue
+                if not (1 <= mon <= 12):
+                    demote(t, "location_visit_targets month越界")
+                    continue
+                if md <= 0:
+                    demote(t, "location_visit_targets min_days非正数")
+                    continue
+                # 单日 date-task 防线: '某号/当天/那天到某地停一趟'是单日打卡(官方按 route_stops/某天停留判,
+                # 非月度N天),易被误编进本月度槽位。若 source_quote 含具体单日标记且无月度累计语义→降级交守护。
+                q = str(t.get("source_quote", ""))
+                if q and any(w in q for w in ("号", "当天", "那天", "这天", "当日")) and not any(
+                    w in q for w in ("每月", "个月", "月度", "累计", "每个月")
+                ):
+                    demote(t, "location_visit_targets 疑似单日date-task(含具体日期、无月度累计语义)", "high")
+                    continue
+                lat, lng = t.get("target_lat"), t.get("target_lng")
+                has_coord = lat is not None and lng is not None
+                if has_coord:
+                    try:
+                        lat, lng = float(lat), float(lng)
+                    except (TypeError, ValueError):
+                        demote(t, "location_visit_targets 坐标非数值", "high")
+                        continue
+                    if not (-90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0):
+                        demote(t, "location_visit_targets 坐标越界", "high")
+                        continue
+                    t["target_lat"], t["target_lng"] = lat, lng
+                kw = str(t.get("keyword", "") or "").strip()
+                if not has_coord and not kw:
+                    demote(t, "location_visit_targets 缺坐标且缺keyword(无可执行锚点)", "high")
+                    continue
+                t["keyword"] = kw
+                try:
+                    r = float(t.get("radius_km"))
+                    t["radius_km"] = r if r > 0 else _VISIT_DEFAULT_RADIUS_KM
+                except (TypeError, ValueError):
+                    t["radius_km"] = _VISIT_DEFAULT_RADIUS_KM
+                if not quote_ok(t):
+                    demote(t, "location_visit_targets source_quote回找失败(疑似幻觉)", "high")
+                    continue
+                t["month"], t["min_days"] = mon, md
+                kept.append(t)
+            ir["location_visit_targets"] = kept
+
             # 5) semantic-family unknown 去重: 与已编译约束 source_quote 互为子串的 unknown=重复,删
             cov_quotes = []
             for fld in ("rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits",
-                        "daily_order_caps", "off_day_requirements", "region_avoid", "origin_avoid", "destination_prefer"):
+                        "daily_order_caps", "off_day_requirements", "location_visit_targets",
+                        "region_avoid", "origin_avoid", "destination_prefer"):
                 for e in ir.get(fld) or []:
                     if isinstance(e, dict):
                         q = _norm_text(str(e.get("source_quote", "")))
@@ -901,6 +1013,7 @@ class ModelDecisionService:
         nph = net / (active_min / 60.0)
         score = net + 5.0 * nph + 12.0 * cand.near_end_cargo_seen - 0.35 * cand.pickup_km
         score += self._target_bonus(cand, pref_policy, ledger, sim_min)
+        score += self._visit_target_bonus(cand, pref_policy, ledger, sim_min)
         score += cand.llm_adjustment  # Council调分(已限幅±800),LLM影响有界、代码裁决
         for limit in self._long_haul_limits(pref_policy):
             threshold = int(limit.get("threshold_minutes", 480) or 480)
@@ -955,6 +1068,51 @@ class ModelDecisionService:
                 bonus += penalty * (1.0 + lam * shortfall) * days_left_factor
             else:
                 bonus += (penalty + 0.12 * penalty * shortfall) * days_left_factor
+        return bonus
+
+    def _visit_target_bonus(
+        self, cand: CandidateFact, pref_policy: dict[str, Any], ledger: dict[str, Any], sim_min: int
+    ) -> float:
+        """目标点打卡引导(死字段补全): 候选终点【真达标】(进 radius / 地名命中)→ +min(penalty,1200),
+        月末欠额时×2 强化压过普通净收益; 仅【120km 内但不达标】→ +通用弱引导(elif 物理隔离,绝不计 visit、
+        绝不叠真达标——120km 当达标会重演'自以为凑满官方照罚')。不veto(作息/上限veto在上游)。"""
+        if not FEATURE_FLAGS.get("location_visit"):
+            return 0.0
+        targets = self._location_visit_targets(pref_policy)
+        if not targets:
+            return 0.0
+        driver_id = getattr(self, "_cur_driver_id", "")
+        try:
+            end_lat, end_lng = _cargo_point(cand.cargo, "end")
+        except Exception:
+            end_lat = end_lng = None
+        region_text = self._cargo_region_text(cand.cargo)
+        nowdt = _SIMULATION_EPOCH + timedelta(minutes=sim_min)
+        bonus = 0.0
+        for target in targets:
+            try:
+                month, min_days = int(target.get("month")), int(target.get("min_days"))
+            except (TypeError, ValueError):
+                continue
+            shortfall = max(0, min_days - len(self._visit_days_by_month(driver_id, target)))
+            if shortfall <= 0:
+                continue
+            penalty = self._target_penalty_amount(target, default=3000.0)
+            if self._hits_visit_target(end_lat, end_lng, region_text, target):
+                base = min(penalty, 1200.0)
+                if month == nowdt.month:
+                    days_left = self._days_in_month(nowdt) - nowdt.day + 1
+                    if days_left <= shortfall + _VISIT_MONTHEND_BUFFER_DAYS:
+                        base *= 2.0  # 月末强化真达标候选(仍不veto)
+                bonus += base
+            elif end_lat is not None:
+                lat, lng = target.get("target_lat"), target.get("target_lng")
+                if lat is not None and lng is not None:
+                    try:
+                        if _haversine_km(end_lat, end_lng, float(lat), float(lng)) <= _VISIT_SCOUT_KM:
+                            bonus += _VISIT_WEAK_BONUS  # 弱引导,绝不计 visit 达标
+                    except (TypeError, ValueError):
+                        pass
         return bonus
 
     def _current_rest_wait_minutes(self, status: dict[str, Any], pref_policy: dict[str, Any]) -> int | None:
@@ -1106,6 +1264,62 @@ class ModelDecisionService:
         ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
         raw = ir.get("off_day_requirements") if isinstance(ir.get("off_day_requirements"), list) else []
         return [x for x in raw if isinstance(x, dict)]
+
+    # ===== 目标点打卡(location_visit_targets)消费链: getter→统一达标判据→visit_days去重 =====
+    @staticmethod
+    def _location_visit_targets(pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
+        ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
+        raw = ir.get("location_visit_targets") if isinstance(ir.get("location_visit_targets"), list) else []
+        return [x for x in raw if isinstance(x, dict)]
+
+    @staticmethod
+    def _cargo_region_text(cargo: dict[str, Any]) -> str:
+        start = cargo.get("start") if isinstance(cargo.get("start"), dict) else {}
+        end = cargo.get("end") if isinstance(cargo.get("end"), dict) else {}
+        keys = ("province", "city", "district", "address")
+        return (" ".join(str(start.get(k, "") or "") for k in keys) + " "
+                + " ".join(str(end.get(k, "") or "") for k in keys))
+
+    @staticmethod
+    def _hits_visit_target(end_lat: Any, end_lng: Any, region_text: str, target: dict[str, Any]) -> bool:
+        """统一达标判据(打分侧与计数侧共用,防口径分裂)。**地名优先(对齐官方唯一存在的 _eval_
+        required_region_cargo_days=按 city 文本含 keyword)**: 只要 target 有 keyword,就以【货源起终点
+        文本含 keyword】判达标,坐标此时仅作 scout/弱引导(不在此判)。仅当【纯坐标、无 keyword】时
+        才回退到终点进 radius_km。否则【地名+坐标都给】的司机会被小半径泡误判、自以为凑满官方照罚。"""
+        kw = str(target.get("keyword") or "").strip()
+        if kw:
+            return kw in (region_text or "")
+        lat, lng = target.get("target_lat"), target.get("target_lng")
+        if lat is not None and lng is not None and end_lat is not None and end_lng is not None:
+            try:
+                r = float(target.get("radius_km") or _VISIT_DEFAULT_RADIUS_KM)
+                return _haversine_km(float(end_lat), float(end_lng), float(lat), float(lng)) <= r
+            except (TypeError, ValueError):
+                return False
+        return False
+
+    def _visit_days_by_month(self, driver_id: str, target: dict[str, Any]) -> set[int]:
+        """该 target 计分月已打卡【天集合】(§9.6 按 day_index 去重)。坐标版按到货日(finish//1440=
+        司机抵达终点之日),地名版按订单起始日(active_start//1440,对齐官方 _eval_required_region_cargo_days)。
+        仅从 chosen_orders(take_order)派生(纯 reposition 打卡留月末强制导向增量处理)。"""
+        try:
+            tgt_month = int(target.get("month"))
+        except (TypeError, ValueError):
+            return set()
+        # 与 _hits_visit_target 同模式: 有 keyword=地名版(按订单起始日,对齐官方); 纯坐标=按到货日
+        is_coord = (not str(target.get("keyword") or "").strip()) and \
+            target.get("target_lat") is not None and target.get("target_lng") is not None
+        days: set[int] = set()
+        for o in self._chosen_orders_by_driver.get(driver_id, []):
+            if not self._hits_visit_target(o.get("end_lat"), o.get("end_lng"), o.get("region_text"), target):
+                continue
+            try:
+                d = (int(o.get("finish", 0)) // 1440) if is_coord else (int(o.get("active_start", 0)) // 1440)
+            except (TypeError, ValueError):
+                continue
+            if (_SIMULATION_EPOCH + timedelta(days=d)).month == tgt_month:
+                days.add(d)
+        return days
 
     def _active_day_set(self, driver_id: str) -> set[int]:
         """活动天集合(activity-interval 口径,对齐官方 _active_minutes_by_day): 任一已选单的
@@ -1847,6 +2061,10 @@ class ModelDecisionService:
         if cand is None:
             return
         active_start = cand.finish_min - cand.pickup_min - cand.wait_min - cand.transport_min
+        try:
+            end_lat, end_lng = _cargo_point(cand.cargo, "end")
+        except Exception:
+            end_lat = end_lng = None
         self._chosen_orders_by_driver.setdefault(driver_id, []).append(
             {
                 "cargo_id": cargo_id,
@@ -1858,6 +2076,9 @@ class ModelDecisionService:
                 "transport_min": cand.transport_min,
                 "pickup_min": cand.pickup_min,
                 "load_wait_min": cand.wait_min,
+                "end_lat": end_lat,             # 坐标版打卡判定(终点进 radius)
+                "end_lng": end_lng,
+                "region_text": self._cargo_region_text(cand.cargo),  # 地名版打卡判定(含 keyword)
             }
         )
 
