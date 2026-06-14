@@ -23,10 +23,6 @@ _DEFAULT_COST_PER_KM = 1.5
 _HORIZON_MINUTES = 92 * 24 * 60
 _TOKEN_SOFT_LIMIT = 4_600_000
 _MAX_WAIT_MINUTES = _HORIZON_MINUTES
-# 每司机 Council(LLM触点#2)调用硬上限——超出走纯确定性 argmax。防 per-step Council 在未知重的
-# 隐藏司机上拖垮复赛4h总时长上限(实测qwen-plus单次~35s、单司机per-step可达~100分钟→必超时)。
-# 主流未知类型(每日上限/回家)已确定性编译化、极少触发Council,本上限只是兜底未预料类型。
-_COUNCIL_CALL_CAP = 40
 
 # ===== K底Z甲 feature flags(形状参数,零偏好常量;全部默认=v19原行为,逐项验证后开启) =====
 FEATURE_FLAGS = {
@@ -194,7 +190,6 @@ class ModelDecisionService:
         # 运行时见过的真实品类名全集(query返回累积,零硬编码)——供编译audit的品类词表校验/snap对齐
         self._seen_cargo_names_by_driver: dict[str, set[str]] = {}
         self._last_reposition_day: dict[str, int] = {}
-        self._council_calls_by_driver: dict[str, int] = {}
 
     def decide(self, driver_id: str) -> dict[str, Any]:
         self._cur_driver_id = driver_id  # 供打分层回查该司机的观测热点(影子价格机会数估计)
@@ -248,14 +243,7 @@ class ModelDecisionService:
             u for u in self._unknown_constraints(pref_policy)
             if str(u.get("risk_level", "")).lower() == "high"
         ]
-        _council_used = self._council_calls_by_driver.get(driver_id, 0)
-        if high_unknowns and candidates and _council_used >= _COUNCIL_CALL_CAP:
-            self._logger.info(
-                "council budget exhausted driver=%s used=%s cap=%s -> 走纯确定性argmax(防超时)",
-                driver_id, _council_used, _COUNCIL_CALL_CAP,
-            )
-        if high_unknowns and candidates and _council_used < _COUNCIL_CALL_CAP:
-            self._council_calls_by_driver[driver_id] = _council_used + 1
+        if high_unknowns and candidates:
             if FEATURE_FLAGS.get("council_v2"):
                 # Council v2: 审【按确定性score排序的top-10】(与argmax对齐,堵"argmax选中
                 # guardian没见过的候选"缺口);未审候选在守护激活时不参与argmax(宁wait不接未审单)
