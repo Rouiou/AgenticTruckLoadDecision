@@ -28,6 +28,9 @@ _VISIT_DEFAULT_RADIUS_KM = 3.0   # 通用默认: 文本未给半径时,坐标版
 _VISIT_SCOUT_KM = 120.0          # 通用外圈: 距目标此距离内仅弱引导/定向scout,绝不当达标(红线)
 _VISIT_WEAK_BONUS = 150.0        # 通用弱引导分值(远小于真达标bonus,且不计入visit计数)
 _VISIT_MONTHEND_BUFFER_DAYS = 2  # 通用缓冲: 月末强化真达标候选的剩余天数阈值
+_HOME_RETURN_MARGIN_MIN = 60     # 通用安全余量: 回家ETA外的缓冲,焊死不动态算(防超时)
+_HOME_DEFAULT_RADIUS_KM = 1.0    # 通用默认: 回家门禁"到家"判定半径(独立于打卡的弱半径)
+_COUNCIL_CALLS_PER_DAY_CAP = 6   # 通用频率节流: 每司机每仿真日 Council 调用硬上限(节流≠砍enforcement)
 
 # ===== K底Z甲 feature flags(形状参数,零偏好常量;全部默认=v19原行为,逐项验证后开启) =====
 FEATURE_FLAGS = {
@@ -43,6 +46,7 @@ FEATURE_FLAGS = {
     "pre_query_rest_guard": True,   # P0-3: 查货前若扫描会跨进禁动窗头→提前wait睡穿(防作息禁动型漏罚)
     "location_visit": True,         # 目标点打卡执行器(getter+visit_days按天去重+真达标bonus);死字段补全
     "recompile_stable_merge": True, # 跨月重编译保护: 稳定约束字段(作息/整歇/区域/长途/打卡)只增不减,防重编译非确定丢窗
+    "home_curfew": False,           # P0-4 回家门禁: 每天回家执行器(built,净正向6000→3000但残留5违规=fallback wait-cap+作息×回家并优先级 interaction,待修后再开)
     "ltd_reposition": False,         # Day4: 受限reposition(三重闸门)
     "dest_value": False,             # Day4: V落点价值表
     "aggressive_fulfill": False,     # 实验: 激进履约(配速驱动)——落后线性配速即λ→1抢配额+提早定向广查;默认关=保守K底Z甲
@@ -198,10 +202,18 @@ class ModelDecisionService:
         # 运行时见过的真实品类名全集(query返回累积,零硬编码)——供编译audit的品类词表校验/snap对齐
         self._seen_cargo_names_by_driver: dict[str, set[str]] = {}
         self._last_reposition_day: dict[str, int] = {}
+        # 首见缓存的初始位置(不随 status 更新): 日历约束的位置回退基准(低置信 home fallback)
+        self._initial_position_by_driver: dict[str, tuple[float, float]] = {}
+        # 每司机每仿真日 Council 调用计数(频率节流用)
+        self._council_calls_by_driver_day: dict[tuple[str, int], int] = {}
 
     def decide(self, driver_id: str) -> dict[str, Any]:
         self._cur_driver_id = driver_id  # 供打分层回查该司机的观测热点(影子价格机会数估计)
         status = self._api.get_driver_status(driver_id)
+        # 首见缓存初始位置(低置信 home fallback;只 setdefault、绝不随 status 更新)
+        self._initial_position_by_driver.setdefault(
+            driver_id, (float(status.get("current_lat", 0) or 0), float(status.get("current_lng", 0) or 0))
+        )
         all_history = self._api.query_decision_history(driver_id, -1)
         records = all_history.get("records") if isinstance(all_history.get("records"), list) else []
         recent = records[-8:]
@@ -228,6 +240,14 @@ class ModelDecisionService:
                 action,
             )
             return action
+
+        home_action = self._home_curfew_decision(driver_id, status, pref_policy)
+        if home_action is not None:
+            self._logger.info(
+                "deterministic home-curfew driver=%s sim_min=%s action=%s",
+                driver_id, status.get("simulation_progress_minutes"), home_action,
+            )
+            return home_action
 
         pre_q_wait = self._pre_query_rest_guard(status, pref_policy, budget_guard)
         if pre_q_wait is not None:
@@ -272,25 +292,34 @@ class ModelDecisionService:
                 # Council v2: 审【按确定性score排序的top-10】(与argmax对齐,堵"argmax选中
                 # guardian没见过的候选"缺口);未审候选在守护激活时不参与argmax(宁wait不接未审单)
                 sim_min_now = int(status_after_query.get("simulation_progress_minutes", 0) or 0)
-                ledger_now = self._preference_ledger(driver_id)
-                ranked = sorted(
-                    (c for c in all_candidates if c.legal and not self._deterministic_vetoes(c, pref_policy, ledger_now)),
-                    key=lambda c: self._candidate_score(c, pref_policy, ledger_now, sim_min_now),
-                    reverse=True,
-                )
-                review_set = ranked[:10]
-                guardian = self._preference_guardian_council(
-                    status_after_query, recent, review_set, cumulative_tokens, pref_policy
-                )
-                all_candidates = self._apply_council_judgments(
-                    all_candidates, review_set, guardian, driver_id=driver_id, sim_min=sim_min_now
-                )
-                mw = guardian.get("must_wait")
-                if mw is True:
-                    rw = _optional_int(guardian.get("recommended_wait_minutes"), 120)
-                    dur = max(30, min(240, rw))  # 钳位; 确定性rest在decide入口已优先,不会被本分支覆盖
-                    self._logger.info("council must_wait driver=%s wait=%s", driver_id, dur)
-                    return {"action": "wait", "params": {"duration_minutes": dur}}
+                cur_day = sim_min_now // 1440
+                council_count = self._council_calls_by_driver_day.get((driver_id, cur_day), 0)
+                if council_count >= _COUNCIL_CALLS_PER_DAY_CAP:
+                    # §9.7 频率节流: 本仿真日 Council 已达上限→跳过 LLM,走纯确定性(home/作息硬防线 veto 独立于
+                    # Council、不漏)。【绝不】在此调 _apply_council_judgments——否则空 guardian 把全部候选标
+                    # unreviewed=全 illegal=整日 wait 灾难(头号坑)。
+                    self._logger.info("council throttled driver=%s day=%s count=%s", driver_id, cur_day, council_count)
+                else:
+                    self._council_calls_by_driver_day[(driver_id, cur_day)] = council_count + 1
+                    ledger_now = self._preference_ledger(driver_id)
+                    ranked = sorted(
+                        (c for c in all_candidates if c.legal and not self._deterministic_vetoes(c, pref_policy, ledger_now)),
+                        key=lambda c: self._candidate_score(c, pref_policy, ledger_now, sim_min_now),
+                        reverse=True,
+                    )
+                    review_set = ranked[:10]
+                    guardian = self._preference_guardian_council(
+                        status_after_query, recent, review_set, cumulative_tokens, pref_policy
+                    )
+                    all_candidates = self._apply_council_judgments(
+                        all_candidates, review_set, guardian, driver_id=driver_id, sim_min=sim_min_now
+                    )
+                    mw = guardian.get("must_wait")
+                    if mw is True:
+                        rw = _optional_int(guardian.get("recommended_wait_minutes"), 120)
+                        dur = max(30, min(240, rw))  # 钳位; 确定性rest在decide入口已优先,不会被本分支覆盖
+                        self._logger.info("council must_wait driver=%s wait=%s", driver_id, dur)
+                        return {"action": "wait", "params": {"duration_minutes": dur}}
             else:
                 guardian = self._preference_guardian_council(
                     status_after_query, recent, candidates, cumulative_tokens, pref_policy
@@ -345,7 +374,7 @@ class ModelDecisionService:
                 "(如每天至少 N 单、每隔 X 天回家、每天在线 X 小时)填 high;"
                 "只是对【已编译约束】的补充说明(罚款金额/周末定义/比上月罚得重/计数口径)填 low。"
                 "【绝对禁止】把已经编进 rest_windows/cargo_targets/long_haul_limits/cargo_max_limits/"
-                "daily_order_caps/off_day_requirements/location_visit_targets/region_avoid 任一字段的偏好,再重复放进 unknown_constraints——那会导致同一约束被"
+                "daily_order_caps/off_day_requirements/location_visit_targets/home_curfews/region_avoid 任一字段的偏好,再重复放进 unknown_constraints——那会导致同一约束被"
                 "结构化执行器和守护层重复处理。unknown_constraints 只放【上述字段都无法表达】的偏好。"
                 "【周期严格匹配】cargo_targets/cargo_max_limits/long_haul_limits 都是【按月】计数的槽位。"
                 "【每日接单数上限】(每天/一天/每日 最多接 N 单)→ 编进 machine_ir.daily_order_caps(max_per_day=N),"
@@ -356,6 +385,11 @@ class ModelDecisionService:
                 "machine_ir.location_visit_targets: 文本给经纬度→填 target_lat/target_lng(radius_km 未给则留空,执行层补通用默认);"
                 "文本只给地名→填 keyword(留空 target_lat/target_lng); min_days=该月需到达的不同【天】数(按天去重,非次数);"
                 "month=计分归属月。由确定性执行器逐月按天打卡+月末兜底导向,不要放 unknown_constraints、也不要塞进 cargo_targets(那是按品类计数)。"
+                "【每天回家+门禁】(每天/每日 X点前回家/到家,且到次日 Y点前不接单/不空驶/不出车)→ 编进 machine_ir.home_curfews: "
+                "文本给家的经纬度→填 home_lat/home_lng;未给坐标→home_lat/home_lng 留 null(执行层用首日初始位置兜底,低置信);"
+                "deadline_hour=每天必须回到家的截止钟点(0-23);quiet_until_hour=次日解禁钟点(0-23);"
+                "forbid_take_order/forbid_reposition 默认 true(文本只禁其一才置另一为 false);penalty_amount 可见则填。"
+                "注意这是【每天】的日历约束;【每隔 X 天回家】(非每天)不属此槽,仍放 unknown。示例(虚构): 每天22点前回家、次日7点前不出车 → deadline_hour=22,quiet_until_hour=7。"
                 "其余非月度周期(每天【至少】N单、每周、每隔 X 天回家 等)schema 无对应槽位——"
                 "严禁硬塞进月度槽位(每日≠每月,塞错会灾难性执行),必须整条放入 unknown_constraints 并注明真实周期。"
                 "若有至少/最多/不得/必须/罚/扣/指标，输出它们的优先级和计数口径。"
@@ -457,6 +491,19 @@ class ModelDecisionService:
                                 "source_quote": "exact text",
                             }
                         ],
+                        "home_curfews": [
+                            {
+                                "home_lat": "latitude number if text gives home coordinates, else null",
+                                "home_lng": "longitude number if text gives home coordinates, else null",
+                                "radius_km": "number if visible, else null (执行层补通用默认)",
+                                "deadline_hour": "0..23 integer (每天必须回到家的截止钟点)",
+                                "quiet_until_hour": "0..23 integer (次日解禁钟点, 在此之前不接单/不空驶)",
+                                "forbid_take_order": "boolean (default true)",
+                                "forbid_reposition": "boolean (default true)",
+                                "penalty_amount": "number if visible",
+                                "source_quote": "exact text",
+                            }
+                        ],
                         "region_avoid": [{"field": "origin|destination|either", "keyword": "city/province/region text"}],
                         "origin_avoid": [{"keyword": "city/province/region text"}],
                         "destination_prefer": [{"keyword": "city/province/region text", "bonus": "number or null"}],
@@ -502,7 +549,7 @@ class ModelDecisionService:
         if pir is None or nir is None:
             return policy
         stable = ("rest_windows", "off_day_requirements", "region_avoid", "origin_avoid",
-                  "long_haul_limits", "daily_order_caps", "location_visit_targets")
+                  "long_haul_limits", "daily_order_caps", "location_visit_targets", "home_curfews")
         cosmetic = {"label", "source_quote", "penalty_amount", "penalty_cap"}
 
         def fsig(e: dict[str, Any]) -> str:  # 功能签名(去掉 label/罚额/quote 等易抖动的装饰字段)
@@ -552,7 +599,7 @@ class ModelDecisionService:
 
         # 【硬执行字段】(有确定性执行器,投票不稳定→降级unknown交守护:错编会真违规):
         hard_fields = ["rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits",
-                       "location_visit_targets", "region_avoid", "origin_avoid"]
+                       "location_visit_targets", "home_curfews", "region_avoid", "origin_avoid"]
         # 【软/无执行字段】(date_or_weekday_rules等在v19无执行器,destination_prefer/makeup另路处理):
         # 投票不稳定时取多数票即可、绝不降级unknown——否则冗余字段抖动会把【全已知司机】踢出
         # 零LLM快车道、每步触发Council(公开司机实测token 9k→742k/79倍)。
@@ -794,6 +841,50 @@ class ModelDecisionService:
                 kept.append(t)
             ir["location_visit_targets"] = kept
 
+            # 4c) home_curfews(每天回家+门禁): deadline/quiet 钟点 0-23 + 坐标【成对或全缺】(全缺=低置信首日fallback,
+            #     保留不删=与 location_visit 无锚点直接降级的关键区别) + radius缺省补 + forbid_* 默认True + quote回找。
+            kept = []
+            for h in ir.get("home_curfews") or []:
+                if not isinstance(h, dict):
+                    continue
+                try:
+                    dh, qh = int(h.get("deadline_hour")), int(h.get("quiet_until_hour"))
+                except (TypeError, ValueError):
+                    demote(h, "home_curfew deadline/quiet钟点非整数", "high")
+                    continue
+                if not (0 <= dh <= 23 and 0 <= qh <= 23):
+                    demote(h, "home_curfew 钟点越界", "high")
+                    continue
+                hlat, hlng = h.get("home_lat"), h.get("home_lng")
+                if (hlat is None) != (hlng is None):
+                    demote(h, "home_curfew 坐标不成对(只给其一)", "high")
+                    continue
+                if hlat is not None:
+                    try:
+                        hlat, hlng = float(hlat), float(hlng)
+                    except (TypeError, ValueError):
+                        demote(h, "home_curfew 坐标非数值", "high")
+                        continue
+                    if not (-90.0 <= hlat <= 90.0 and -180.0 <= hlng <= 180.0):
+                        demote(h, "home_curfew 坐标越界", "high")
+                        continue
+                    h["home_lat"], h["home_lng"] = hlat, hlng
+                # 无坐标=保留(执行层用首日fallback,低置信),不降级
+                try:
+                    rr = float(h.get("radius_km"))
+                    h["radius_km"] = rr if rr > 0 else _HOME_DEFAULT_RADIUS_KM
+                except (TypeError, ValueError):
+                    h["radius_km"] = _HOME_DEFAULT_RADIUS_KM
+                ft, fr = h.get("forbid_take_order"), h.get("forbid_reposition")
+                h["forbid_take_order"] = True if ft is None else bool(ft)
+                h["forbid_reposition"] = True if fr is None else bool(fr)
+                h["deadline_hour"], h["quiet_until_hour"] = dh, qh
+                if not quote_ok(h):
+                    demote(h, "home_curfew source_quote回找失败(疑似幻觉)", "high")
+                    continue
+                kept.append(h)
+            ir["home_curfews"] = kept
+
             # 5) semantic-family unknown 去重: 与已编译约束 source_quote 互为子串的 unknown=重复,删
             cov_quotes = []
             for fld in ("rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits",
@@ -804,6 +895,13 @@ class ModelDecisionService:
                         q = _norm_text(str(e.get("source_quote", "")))
                         if q:
                             cov_quotes.append(q)
+            # home_curfews: 仅【高置信(原文显式坐标)】清对应 unknown(确定性全履约);低置信(无坐标用首日fallback)
+            # 保留 unknown 交 Council(已被每日频率节流,不超时)。§9.7
+            for h in ir.get("home_curfews") or []:
+                if isinstance(h, dict) and h.get("home_lat") is not None:
+                    q = _norm_text(str(h.get("source_quote", "")))
+                    if q:
+                        cov_quotes.append(q)
             pref_norms = [_norm_text(str(p.get("content", "")) if isinstance(p, dict) else str(p)) for p in prefs]
             # 【配额型偏好原文】(产出了 cargo_target/cargo_max 的那条 pref)：其配额已由确定性
             # 影子价格+makeup结转履约,该 pref 的所有 unknown 子句(含"补欠额/罚得比上月重"等
@@ -915,6 +1013,7 @@ class ModelDecisionService:
         if repo is not None:
             return repo
         wait = self._next_useful_wait_minutes(sim_min, pref_policy)
+        wait = self._cap_wait_for_home(driver_id, status, sim_min, wait, pref_policy)
         self._logger.info("deterministic_wait no_positive_candidate wait=%s seen=%s", wait, len(candidates))
         return {"action": "wait", "params": {"duration_minutes": wait}}
 
@@ -1003,6 +1102,35 @@ class ModelDecisionService:
                 break
         if self._matches_region_avoid(cand.cargo, pref_policy):
             vetoes.append("region_avoid")
+        # 回家门禁型 候选 veto(两条件,全 try 守护防炸主线):
+        # ①该单活动区间 [active_start, finish] 跨进任一门禁 quiet 窗 → 在外作业/在途=没在家 → veto(关键:挡跨夜/晚归单)。
+        # ②完成后回家来不及(finish + ETA(终点→home) + margin > finish 所在日 deadline)→ veto。
+        if FEATURE_FLAGS.get("home_curfew"):
+            for qs, qe in self._home_quiet_intervals_around(active_start, cand.finish_min, pref_policy):
+                if _interval_overlap(active_start, cand.finish_min, qs, qe):
+                    vetoes.append("home_curfew_overlap")
+                    break
+            if "home_curfew_overlap" not in vetoes:
+                driver_id = getattr(self, "_cur_driver_id", "")
+                try:
+                    end_lat, end_lng = _cargo_point(cand.cargo, "end")
+                except Exception:
+                    end_lat = end_lng = None
+                if end_lat is not None:
+                    for hc in self._home_curfews(pref_policy):
+                        home = self._resolve_home_coord(driver_id, hc)
+                        if home is None:
+                            continue
+                        try:
+                            deadline_hour = int(hc.get("deadline_hour"))
+                        except (TypeError, ValueError):
+                            continue
+                        finish_day = cand.finish_min // 1440
+                        today_deadline = finish_day * 1440 + deadline_hour * 60
+                        eta_home = self._eta_between(end_lat, end_lng, home[0], home[1])
+                        if cand.finish_min + eta_home + _HOME_RETURN_MARGIN_MIN > today_deadline:
+                            vetoes.append("home_curfew_no_return")
+                            break
         return vetoes
 
     def _candidate_score(
@@ -1170,9 +1298,9 @@ class ModelDecisionService:
 
     def _merge_no_go_segments(self, start_min: int, end_min: int, pref_policy: dict[str, Any]) -> list[tuple[int, int]]:
         """§9.4: 当日"禁动区间"并集→合并相邻/重叠窗成连续禁动段,睡穿时睡到段的【真正末端】
-        (而非单个窗的末端),防"睡到A窗尾紧接着违反相邻B窗"。当前并集源=作息禁动窗;
-        回家门禁型(home-quiet)落地后在此并入(同一并集口径)。"""
+        (而非单个窗的末端),防"睡到A窗尾紧接着违反相邻B窗"。并集源=作息禁动窗 ∪ 回家门禁 quiet 窗。"""
         raw = self._rest_intervals_around(start_min, end_min, pref_policy)
+        raw = raw + self._home_quiet_intervals_around(start_min, end_min, pref_policy)
         if not raw:
             return []
         raw.sort()
@@ -1271,6 +1399,137 @@ class ModelDecisionService:
         ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
         raw = ir.get("location_visit_targets") if isinstance(ir.get("location_visit_targets"), list) else []
         return [x for x in raw if isinstance(x, dict)]
+
+    # ===== 每天回家+门禁(home_curfews)消费链: getter→home坐标裁决→ETA→候选veto/quiet窗wait/临界强制回家 =====
+    @staticmethod
+    def _home_curfews(pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
+        ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
+        raw = ir.get("home_curfews") if isinstance(ir.get("home_curfews"), list) else []
+        return [x for x in raw if isinstance(x, dict)]
+
+    @staticmethod
+    def _eta_between(from_lat: float, from_lng: float, to_lat: float, to_lng: float) -> int:
+        """回家/到点 ETA(分钟),与仿真 reposition 同基准: haversine 直线距 + distance_to_minutes(speed=60)。
+        仿真 reposition(simulation_actions)恒用 haversine+reposition_speed=60,故本 ETA 与仿真完全一致(§9.2)。"""
+        return _distance_minutes(_haversine_km(from_lat, from_lng, to_lat, to_lng), _DEFAULT_SPEED_KMPH)
+
+    def _resolve_home_coord(self, driver_id: str, curfew: dict[str, Any]) -> tuple[float, float, str] | None:
+        """home 坐标裁决: ①原文显式坐标(高置信 'explicit') ②首日初始坐标 fallback(低置信 'initial');
+        绝不用夜间停留众数格。返回 (lat,lng,confidence) 或 None(无可用坐标)。(0,0) 哨兵视为无效。"""
+        hlat, hlng = curfew.get("home_lat"), curfew.get("home_lng")
+        if hlat is not None and hlng is not None:
+            try:
+                return float(hlat), float(hlng), "explicit"
+            except (TypeError, ValueError):
+                pass
+        init = self._initial_position_by_driver.get(driver_id)
+        if init and not (abs(init[0]) < 1e-9 and abs(init[1]) < 1e-9):
+            return init[0], init[1], "initial"
+        return None
+
+    def _home_quiet_intervals_around(self, start_min: int, end_min: int, pref_policy: dict[str, Any]) -> list[tuple[int, int]]:
+        """home 门禁 quiet 区间(供 §9.4 并集): 每天 [deadline_hour, 次日 quiet_until_hour] = 必须在家、不接单不空驶。
+        只给时间窗(不需 home 坐标)。flag 关或无 home_curfews 返回 []。"""
+        if not FEATURE_FLAGS.get("home_curfew"):
+            return []
+        curfews = self._home_curfews(pref_policy)
+        if not curfews:
+            return []
+        first_day = start_min // 1440 - 1
+        last_day = max(first_day, end_min // 1440 + 1)
+        out: list[tuple[int, int]] = []
+        for day in range(first_day, last_day + 1):
+            for hc in curfews:
+                try:
+                    dh, qh = int(hc.get("deadline_hour")), int(hc.get("quiet_until_hour"))
+                except (TypeError, ValueError):
+                    continue
+                out.append((day * 1440 + dh * 60, (day + 1) * 1440 + qh * 60))
+        return out
+
+    def _home_curfew_decision(self, driver_id: str, status: dict[str, Any], pref_policy: dict[str, Any]) -> dict[str, Any] | None:
+        """回家门禁型 三消费者: ①quiet窗内在家→wait到解禁;不在家→reposition回家 ②(候选veto在_deterministic_vetoes)
+        ③临界(deadline前ETA+margin赶不及)→提前reposition回家。home坐标缺则首日fallback。flag关/无curfew→None。"""
+        if not FEATURE_FLAGS.get("home_curfew"):
+            return None
+        curfews = self._home_curfews(pref_policy)
+        if not curfews:
+            return None
+        sim_min = int(status.get("simulation_progress_minutes", 0) or 0)
+        cur_lat = float(status.get("current_lat", 0) or 0)
+        cur_lng = float(status.get("current_lng", 0) or 0)
+        today = sim_min // 1440
+        for hc in curfews:
+            home = self._resolve_home_coord(driver_id, hc)
+            if home is None:
+                continue
+            try:
+                dh, qh = int(hc.get("deadline_hour")), int(hc.get("quiet_until_hour"))
+            except (TypeError, ValueError):
+                continue
+            home_lat, home_lng, _conf = home
+            radius = float(hc.get("radius_km") or _HOME_DEFAULT_RADIUS_KM)
+            at_home = _haversine_km(cur_lat, cur_lng, home_lat, home_lng) <= radius
+            today_deadline = today * 1440 + dh * 60
+            # 当前是否落在某 quiet 窗内([d deadline, d+1 release]): 查今夜与昨夜两段
+            in_today = today_deadline <= sim_min < (today + 1) * 1440 + qh * 60
+            in_prev = (today - 1) * 1440 + dh * 60 <= sim_min < today * 1440 + qh * 60
+            if in_today or in_prev:
+                # quiet 窗内: 一律【原地 wait】睡到(合并)禁动段真正末端(§9.4)。在家=合规静默;不在家=该天已失,
+                # 也只能静默 wait——reposition 回家会多触发门禁内活动(空驶)+可能撞作息窗=自造多重罚(对抗审查 blocker)。
+                quiet_end = ((today + 1) * 1440 + qh * 60) if in_today else (today * 1440 + qh * 60)
+                seg_end = self._no_go_segment_end(sim_min, pref_policy)
+                end = max(seg_end, quiet_end) if seg_end is not None else quiet_end
+                return {"action": "wait", "params": {"duration_minutes": max(1, min(_MAX_WAIT_MINUTES, end - sim_min))}}
+            # 临界强制回家(deadline 前): 赶不及(ETA+margin>=剩余时间)且不在家→回家;但若 reposition 途中跨任何
+            # 禁动段(作息/门禁窗)→改睡穿到该段末端(放弃当天回家也好过自造作息+门禁多重罚)。
+            if sim_min < today_deadline and not at_home:
+                eta = self._eta_between(cur_lat, cur_lng, home_lat, home_lng)
+                if eta + _HOME_RETURN_MARGIN_MIN >= today_deadline - sim_min:
+                    hit = next(
+                        ((s, e) for s, e in self._merge_no_go_segments(sim_min, sim_min + eta + 1, pref_policy)
+                         if _interval_overlap(sim_min, sim_min + eta, s, e)),
+                        None,
+                    )
+                    if hit is not None:
+                        return {"action": "wait", "params": {"duration_minutes": max(1, min(_MAX_WAIT_MINUTES, hit[1] - sim_min))}}
+                    return {"action": "reposition", "params": {"latitude": home_lat, "longitude": home_lng}}
+        return None
+
+    def _no_go_segment_end(self, sim_min: int, pref_policy: dict[str, Any]) -> int | None:
+        """返回覆盖 sim_min 的(合并)禁动段(作息∪门禁quiet)真正末端;不在任何段内→None。"""
+        for s, e in self._merge_no_go_segments(sim_min, sim_min + 24 * 60, pref_policy):
+            if s <= sim_min < e:
+                return e
+        return None
+
+    def _cap_wait_for_home(self, driver_id: str, status: dict[str, Any], sim_min: int, wait: int,
+                           pref_policy: dict[str, Any]) -> int:
+        """无单 fallback wait 时,夹钳 wait 使司机在【最迟该出发回家的时刻(deadline-ETA-margin)】醒来,
+        别一觉睡过 deadline 错过回家(否则 home_curfew 决策没机会触发临界回家)。无 home_curfew→原值。"""
+        if not FEATURE_FLAGS.get("home_curfew") or wait <= 0:
+            return wait
+        curfews = self._home_curfews(pref_policy)
+        if not curfews:
+            return wait
+        cur_lat = float(status.get("current_lat", 0) or 0)
+        cur_lng = float(status.get("current_lng", 0) or 0)
+        today = sim_min // 1440
+        for hc in curfews:
+            home = self._resolve_home_coord(driver_id, hc)
+            if home is None:
+                continue
+            try:
+                dh = int(hc.get("deadline_hour"))
+            except (TypeError, ValueError):
+                continue
+            eta = self._eta_between(cur_lat, cur_lng, home[0], home[1])
+            for d in (today, today + 1):
+                latest_leave = d * 1440 + dh * 60 - eta - _HOME_RETURN_MARGIN_MIN
+                if latest_leave > sim_min:
+                    wait = min(wait, latest_leave - sim_min)
+                    break
+        return max(1, wait)
 
     @staticmethod
     def _cargo_region_text(cargo: dict[str, Any]) -> str:
