@@ -201,6 +201,14 @@ class ModelDecisionService:
         budget_guard = cumulative_tokens >= _TOKEN_SOFT_LIMIT
         pref_policy = self._compiled_preference_policy(status, recent)
 
+        off_wait = self._forced_off_day_wait(driver_id, status, pref_policy)
+        if off_wait is not None:
+            self._logger.info(
+                "deterministic off-day driver=%s sim_min=%s wait=%s",
+                driver_id, status.get("simulation_progress_minutes"), off_wait,
+            )
+            return {"action": "wait", "params": {"duration_minutes": off_wait}}
+
         rest_wait = self._current_rest_wait_minutes(status, pref_policy)
         if rest_wait is not None:
             action = {"action": "wait", "params": {"duration_minutes": rest_wait}}
@@ -308,17 +316,24 @@ class ModelDecisionService:
                 "原窗 A点至B点 → 新窗 (A+N)点至B点；严禁输出 (A+N)点至(B+N)点，"
                 "除非文本明确说晚 N 小时起床/晚 N 小时结束/休息结束顺延。"
                 "数字示例(虚构,仅示意规则): 19:00-05:00 + 晚一个小时再休息 = 20:00-05:00。"
+                "【时长型作息‼️】若文本是'每天至少连续休息N小时/连续停车熄火满N小时'(只给时长、不给具体钟点),"
+                "【严禁】输出 start_hour==end_hour 的占位窗(会被执行成整天休息=毛利归零灾难)。官方按【单个日历日内"
+                "(00:00-24:00)最长连续休息≥N小时】判定——跨午夜的窗会被午夜切成两段、两天都不足N→必须落成一个"
+                "【不跨午夜、同一日内的N小时窗】: start_hour=0, end_hour=N, days=all (00:00至N点,清晨低价值时段)。"
+                "例: 每天连续休息8小时→start_hour=0,end_hour=8。"
                 "每条约束必须输出 source_quote 字段=依据的偏好原文片段(逐字摘录,供审计回查)。"
                 "若原文暗示但未明说某约束(隐式约束),也要列出并标 low confidence,放入 unknown_constraints。"
                 "unknown_constraints 的 risk_level 严格区分:【需要 agent 采取额外行动才能满足】"
                 "(如每天至少 N 单、每隔 X 天回家、每天在线 X 小时、去某地累计 N 天)填 high;"
                 "只是对【已编译约束】的补充说明(罚款金额/周末定义/比上月罚得重/计数口径)填 low。"
                 "【绝对禁止】把已经编进 rest_windows/cargo_targets/long_haul_limits/cargo_max_limits/"
-                "daily_order_caps/region_avoid 任一字段的偏好,再重复放进 unknown_constraints——那会导致同一约束被"
+                "daily_order_caps/off_day_requirements/region_avoid 任一字段的偏好,再重复放进 unknown_constraints——那会导致同一约束被"
                 "结构化执行器和守护层重复处理。unknown_constraints 只放【上述字段都无法表达】的偏好。"
                 "【周期严格匹配】cargo_targets/cargo_max_limits/long_haul_limits 都是【按月】计数的槽位。"
                 "【每日接单数上限】(每天/一天/每日 最多接 N 单)→ 编进 machine_ir.daily_order_caps(max_per_day=N),"
                 "由确定性执行器按日计数拦截,不要放进月度槽位、也不要放 unknown_constraints。"
+                "【整天歇车】(每月至少N整天不出车/歇车/完全不出工/那天别排活的整天) → 编进 "
+                "machine_ir.off_day_requirements(min_off_days=N),由确定性执行器月末预留整天,不要放 unknown_constraints。"
                 "其余非月度周期(每天【至少】N单、每周、每隔 X 天回家、到某地累计 N 天 等)schema 无对应槽位——"
                 "严禁硬塞进月度槽位(每日≠每月,塞错会灾难性执行),必须整条放入 unknown_constraints 并注明真实周期。"
                 "若有至少/最多/不得/必须/罚/扣/指标，输出它们的优先级和计数口径。"
@@ -397,6 +412,13 @@ class ModelDecisionService:
                         "daily_order_caps": [
                             {
                                 "max_per_day": "integer (每天/一天/每日 最多接 N 单 → N)",
+                                "penalty_amount": "number if visible",
+                                "source_quote": "exact text",
+                            }
+                        ],
+                        "off_day_requirements": [
+                            {
+                                "min_off_days": "integer (每月至少N整天不出车/歇车/完全不出工 → N)",
                                 "penalty_amount": "number if visible",
                                 "source_quote": "exact text",
                             }
@@ -652,7 +674,7 @@ class ModelDecisionService:
             # 5) semantic-family unknown 去重: 与已编译约束 source_quote 互为子串的 unknown=重复,删
             cov_quotes = []
             for fld in ("rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits",
-                        "daily_order_caps", "region_avoid", "origin_avoid", "destination_prefer"):
+                        "daily_order_caps", "off_day_requirements", "region_avoid", "origin_avoid", "destination_prefer"):
                 for e in ir.get(fld) or []:
                     if isinstance(e, dict):
                         q = _norm_text(str(e.get("source_quote", "")))
@@ -963,6 +985,11 @@ class ModelDecisionService:
                         continue
                 sh = _optional_int(window.get("start_hour"), 21)
                 eh = _optional_int(window.get("end_hour"), 6)
+                if sh == eh:
+                    # start==end 是"时长约束"(如"连续休息N小时")被误塞进钟点schema的占位artifact
+                    # (0/0→整天)——绝不执行成全天休息(实测致重作息司机 net=0 毛利灾难)。时长类应由
+                    # 编译期改写成具体过夜窗(end=6/start=(6-N));此处兜底跳过占位窗。
+                    continue
                 s = day * 1440 + sh * 60
                 e = day * 1440 + eh * 60
                 if e <= s:
@@ -1029,6 +1056,46 @@ class ModelDecisionService:
         ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
         raw = ir.get("daily_order_caps") if isinstance(ir.get("daily_order_caps"), list) else []
         return [x for x in raw if isinstance(x, dict)]
+
+    @staticmethod
+    def _off_day_requirements(pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
+        ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
+        raw = ir.get("off_day_requirements") if isinstance(ir.get("off_day_requirements"), list) else []
+        return [x for x in raw if isinstance(x, dict)]
+
+    def _off_days_taken(self, driver_id: str, sim_min: int) -> int:
+        """本月已取得的整天歇车数 = 过去日(不含今天)中接单数为0的天(reposition关→无接单即活动0)。"""
+        counts = (self._preference_ledger(driver_id).get("order_count_by_day") or {})
+        now = _SIMULATION_EPOCH + timedelta(minutes=sim_min)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        start_day = int((month_start - _SIMULATION_EPOCH).total_seconds() // 60) // 1440
+        today = sim_min // 1440
+        return sum(1 for d in range(start_day, today) if int(counts.get(f"day{d}", 0) or 0) == 0)
+
+    def _forced_off_day_wait(self, driver_id: str, status: dict[str, Any], pref_policy: dict[str, Any]) -> int | None:
+        """每月至少N整天不出车: 月末逼近(剩余天数 <= 还需off天数+1缓冲)且今天还没接单时,
+        强制整天歇(歇到今日结束)。对齐官方 _eval_off_days(当日活动分钟==0)。reposition关→不歇车的天必有接单。"""
+        reqs = self._off_day_requirements(pref_policy)
+        if not reqs:
+            return None
+        sim_min = int(status.get("simulation_progress_minutes", 0) or 0)
+        now = _SIMULATION_EPOCH + timedelta(minutes=sim_min)
+        days_left = self._days_in_month(now) - now.day + 1  # 含今天的本月剩余天数
+        taken = self._off_days_taken(driver_id, sim_min)
+        today = sim_min // 1440
+        counts = (self._preference_ledger(driver_id).get("order_count_by_day") or {})
+        today_orders = int(counts.get(f"day{today}", 0) or 0)
+        for req in reqs:
+            try:
+                need = int(req.get("min_off_days"))
+            except (TypeError, ValueError):
+                continue
+            still = need - taken
+            if still <= 0:
+                continue
+            if days_left <= still + 1 and today_orders == 0:
+                return max(1, 1440 - (sim_min % 1440))  # 歇到今日结束=整天off
+        return None
 
     @staticmethod
     def _cargo_targets(pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
