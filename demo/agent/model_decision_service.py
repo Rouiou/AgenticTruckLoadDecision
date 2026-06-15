@@ -1334,6 +1334,12 @@ class ModelDecisionService:
                 continue
             penalty = self._target_penalty_amount(target, default=700.0)
             days_left_factor = 1.0 + max(0, now_month - month + 1) * 0.35
+            urgency_factor = 1.0
+            if month == now_month:
+                nowdt = _SIMULATION_EPOCH + timedelta(minutes=sim_min)
+                days_remaining = self._days_in_month(nowdt) - nowdt.day + 1
+                if days_remaining <= shortfall + 3:
+                    urgency_factor += min(1.0, 0.5 + shortfall / max(1, days_remaining))
             if FEATURE_FLAGS.get("subgrad_shadow"):
                 # 次梯度影子价格(拉格朗日松弛): 紧迫度λ=欠额/剩余机会数估计。
                 # 机会数=该品类近期日均可见单数(观测热点统计)×当月剩余天数;无观测→保守取欠额本身(λ=1)。
@@ -1351,9 +1357,9 @@ class ModelDecisionService:
                     nowdt = _SIMULATION_EPOCH + timedelta(minutes=sim_min)
                     if month != now_month or used * self._days_in_month(nowdt) < min_count * nowdt.day:
                         lam = 1.0
-                bonus += penalty * (1.0 + lam * shortfall) * days_left_factor
+                bonus += penalty * (1.0 + lam * shortfall) * days_left_factor * urgency_factor
             else:
-                bonus += (penalty + 0.12 * penalty * shortfall) * days_left_factor
+                bonus += (penalty + 0.12 * penalty * shortfall) * days_left_factor * urgency_factor
         return bonus
 
     def _visit_target_bonus(

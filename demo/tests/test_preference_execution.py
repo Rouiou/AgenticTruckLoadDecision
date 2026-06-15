@@ -275,5 +275,27 @@ class HomeCurfewTests(unittest.TestCase):
         self.assertEqual(action, {"action": "wait", "params": {"duration_minutes": 8 * 60}})
 
 
+class TargetUrgencyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.service = ModelDecisionService(api=None)
+        self.policy = {
+            "machine_ir": {
+                "cargo_targets": [
+                    {"month": 4, "cargo_name": "测试货", "min_count": 12, "penalty_amount": 500}
+                ]
+            }
+        }
+        self.ledger = {"cargo_name_counts_by_month": {"2026-04": {"测试货": 11}}}
+
+    def test_monthend_shortfall_has_more_value_than_early_shortfall(self) -> None:
+        early_april = 31 * 1440
+        late_april = (31 + 27) * 1440
+
+        early = self.service._target_bonus(candidate(), self.policy, self.ledger, early_april)
+        late = self.service._target_bonus(candidate(), self.policy, self.ledger, late_april)
+
+        self.assertGreater(late, early)
+
+
 if __name__ == "__main__":
     unittest.main()
