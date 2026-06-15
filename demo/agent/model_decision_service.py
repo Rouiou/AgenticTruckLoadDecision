@@ -46,10 +46,10 @@ FEATURE_FLAGS = {
     "pre_query_rest_guard": True,   # P0-3: 查货前若扫描会跨进禁动窗头→提前wait睡穿(防作息禁动型漏罚)
     "location_visit": True,         # 目标点打卡执行器(getter+visit_days按天去重+真达标bonus);死字段补全
     "recompile_stable_merge": True, # 跨月重编译保护: 稳定约束字段(作息/整歇/区域/长途/打卡)只增不减,防重编译非确定丢窗
-    "home_curfew": False,           # P0-4 回家门禁: 每天回家执行器(built,净正向6000→3000但残留5违规=fallback wait-cap+作息×回家并优先级 interaction,待修后再开)
+    "home_curfew": True,            # P0-4 回家门禁: 每天回家执行器
     "ltd_reposition": False,         # Day4: 受限reposition(三重闸门)
     "dest_value": False,             # Day4: V落点价值表
-    "aggressive_fulfill": False,     # 实验: 激进履约(配速驱动)——落后线性配速即λ→1抢配额+提早定向广查;默认关=保守K底Z甲
+    "aggressive_fulfill": True,      # 配速驱动履约: 落后线性配速即λ→1抢配额+提早定向广查
 }
 
 
@@ -390,6 +390,10 @@ class ModelDecisionService:
                 "deadline_hour=每天必须回到家的截止钟点(0-23);quiet_until_hour=次日解禁钟点(0-23);"
                 "forbid_take_order/forbid_reposition 默认 true(文本只禁其一才置另一为 false);penalty_amount 可见则填。"
                 "注意这是【每天】的日历约束;【每隔 X 天回家】(非每天)不属此槽,仍放 unknown。示例(虚构): 每天22点前回家、次日7点前不出车 → deadline_hour=22,quiet_until_hour=7。"
+                "【接单触发规则】统一编进 machine_ir.order_rules。适用于品类/装货地/卸货地/任一地区/"
+                "赴装货空驶距离/干线运输时长等条件。若原文说触发一次扣多少钱，effect=penalty 且 penalty_amount"
+                "填可见罚款；若原文明说绝对禁止且没有可权衡罚款，effect=hard_veto。不要把有明确罚款的规则编成"
+                "hard_veto，因为高收益订单扣除罚款后仍可能值得接。"
                 "其余非月度周期(每天【至少】N单、每周、每隔 X 天回家 等)schema 无对应槽位——"
                 "严禁硬塞进月度槽位(每日≠每月,塞错会灾难性执行),必须整条放入 unknown_constraints 并注明真实周期。"
                 "若有至少/最多/不得/必须/罚/扣/指标，输出它们的优先级和计数口径。"
@@ -504,6 +508,16 @@ class ModelDecisionService:
                                 "source_quote": "exact text",
                             }
                         ],
+                        "order_rules": [
+                            {
+                                "field": "cargo_name|start_region|end_region|either_region|deadhead_km|transport_minutes",
+                                "op": "contains|equals|gt|gte|lt|lte",
+                                "value": "string, string array, or number",
+                                "effect": "penalty|hard_veto",
+                                "penalty_amount": "non-negative number; required for penalty",
+                                "source_quote": "exact text",
+                            }
+                        ],
                         "region_avoid": [{"field": "origin|destination|either", "keyword": "city/province/region text"}],
                         "origin_avoid": [{"keyword": "city/province/region text"}],
                         "destination_prefer": [{"keyword": "city/province/region text", "bonus": "number or null"}],
@@ -548,7 +562,7 @@ class ModelDecisionService:
         pir = prior.get("machine_ir") if isinstance(prior, dict) and isinstance(prior.get("machine_ir"), dict) else None
         if pir is None or nir is None:
             return policy
-        stable = ("rest_windows", "off_day_requirements", "region_avoid", "origin_avoid",
+        stable = ("rest_windows", "off_day_requirements", "region_avoid", "origin_avoid", "order_rules",
                   "long_haul_limits", "daily_order_caps", "location_visit_targets", "home_curfews")
         cosmetic = {"label", "source_quote", "penalty_amount", "penalty_cap"}
 
@@ -598,7 +612,7 @@ class ModelDecisionService:
             )
 
         # 【硬执行字段】(有确定性执行器,投票不稳定→降级unknown交守护:错编会真违规):
-        hard_fields = ["rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits",
+        hard_fields = ["rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits", "order_rules",
                        "location_visit_targets", "home_curfews", "region_avoid", "origin_avoid"]
         # 【软/无执行字段】(date_or_weekday_rules等在v19无执行器,destination_prefer/makeup另路处理):
         # 投票不稳定时取多数票即可、绝不降级unknown——否则冗余字段抖动会把【全已知司机】踢出
@@ -787,6 +801,140 @@ class ModelDecisionService:
                     kept.append(r)
                 ir[fld] = kept
 
+            # 4a) 通用接单规则: 只允许客观候选字段、通用比较算子和两种经济效果。
+            kept = []
+            allowed_fields = {
+                "cargo_name", "start_region", "end_region", "either_region",
+                "deadhead_km", "transport_minutes",
+            }
+            allowed_ops = {"contains", "equals", "gt", "gte", "lt", "lte"}
+            for r in ir.get("order_rules") or []:
+                if not isinstance(r, dict):
+                    continue
+                field = str(r.get("field", "") or "").strip()
+                op = str(r.get("op", "") or "").strip()
+                effect = str(r.get("effect", "") or "").strip()
+                if field not in allowed_fields or op not in allowed_ops or effect not in ("penalty", "hard_veto"):
+                    demote(r, "order_rule字段/算子/effect不在白名单", "high")
+                    continue
+                if r.get("value") is None:
+                    demote(r, "order_rule缺value", "high")
+                    continue
+                if field in ("deadhead_km", "transport_minutes") or op in ("gt", "gte", "lt", "lte"):
+                    try:
+                        r["value"] = float(r["value"])
+                    except (TypeError, ValueError):
+                        demote(r, "order_rule数值比较的value非数值", "high")
+                        continue
+                if effect == "penalty":
+                    try:
+                        penalty = float(r.get("penalty_amount"))
+                    except (TypeError, ValueError):
+                        demote(r, "order_rule penalty缺有效罚款", "high")
+                        continue
+                    if penalty < 0:
+                        demote(r, "order_rule penalty为负数", "high")
+                        continue
+                    r["penalty_amount"] = penalty
+                if not str(r.get("source_quote", "") or "").strip() or not quote_ok(r):
+                    demote(r, "order_rule source_quote回找失败(疑似幻觉)", "high")
+                    continue
+                kept.append(r)
+            ir["order_rules"] = kept
+            ir["order_rules"] = [
+                r for r in ir["order_rules"]
+                if not (
+                    r.get("field") == "cargo_name"
+                    and r.get("op") in ("contains", "equals")
+                    and any(
+                        str(v).strip() and (str(v).strip() in target_name or target_name in str(v).strip())
+                        for v in (r.get("value") if isinstance(r.get("value"), list) else [r.get("value")])
+                        for target_name in target_names
+                    )
+                )
+            ]
+            if len(ir["order_rules"]) != len(kept):
+                self._logger.info("audit移除与最低配额目标冲突的order_rule")
+            kept = ir["order_rules"]
+            aggregate_quotes = [
+                _norm_text(str(r.get("source_quote", "")))
+                for fld in ("long_haul_limits", "cargo_max_limits", "daily_order_caps")
+                for r in (ir.get(fld) or [])
+                if isinstance(r, dict) and str(r.get("source_quote", "")).strip()
+            ]
+
+            def duplicates_aggregate_limit(r: dict[str, Any]) -> bool:
+                if r.get("effect") != "penalty":
+                    return False
+                if r.get("field") == "transport_minutes" and r.get("op") in ("gt", "gte"):
+                    try:
+                        value = float(r.get("value"))
+                    except (TypeError, ValueError):
+                        return False
+                    return any(
+                        isinstance(limit, dict)
+                        and float(limit.get("threshold_minutes")) == value
+                        for limit in (ir.get("long_haul_limits") or [])
+                        if limit.get("threshold_minutes") is not None
+                    )
+                if r.get("field") == "cargo_name" and r.get("op") in ("contains", "equals"):
+                    values = r.get("value") if isinstance(r.get("value"), list) else [r.get("value")]
+                    names = {
+                        str(limit.get("cargo_name", "") or "").strip()
+                        for limit in (ir.get("cargo_max_limits") or [])
+                        if isinstance(limit, dict)
+                    }
+                    return any(str(v).strip() in names for v in values)
+                return False
+
+            ir["order_rules"] = [
+                r for r in ir["order_rules"]
+                if not (
+                    duplicates_aggregate_limit(r)
+                    or (
+                        r.get("effect") == "penalty"
+                        and any(
+                            q and (q in _norm_text(str(r.get("source_quote", ""))) or _norm_text(str(r.get("source_quote", ""))) in q)
+                            for q in aggregate_quotes
+                        )
+                    )
+                )
+            ]
+            if len(ir["order_rules"]) != len(kept):
+                self._logger.info("audit移除与累计上限重复的逐单罚款order_rule")
+            kept = ir["order_rules"]
+            penalty_region_rules = [
+                r for r in kept
+                if r.get("effect") == "penalty"
+                and r.get("field") in ("start_region", "end_region", "either_region")
+                and r.get("op") in ("contains", "equals")
+            ]
+            for fld in ("region_avoid", "origin_avoid"):
+                softened = []
+                for r in ir.get(fld) or []:
+                    keyword = str(r.get("keyword") or r.get("region") or "").strip()
+                    region_field = str(r.get("field") or ("origin" if fld == "origin_avoid" else "either")).lower()
+                    compatible_fields = {
+                        "origin": {"start_region", "either_region"},
+                        "start": {"start_region", "either_region"},
+                        "destination": {"end_region", "either_region"},
+                        "end": {"end_region", "either_region"},
+                        "either": {"either_region"},
+                        "any": {"either_region"},
+                        "all": {"either_region"},
+                    }.get(region_field, {"either_region"})
+                    duplicate_soft = any(
+                        pr.get("field") in compatible_fields
+                        and keyword
+                        and any(keyword == str(v) for v in (pr.get("value") if isinstance(pr.get("value"), list) else [pr.get("value")]))
+                        for pr in penalty_region_rules
+                    )
+                    if duplicate_soft:
+                        self._logger.info("audit移除与罚款order_rule重复的地区硬禁: %s", keyword)
+                        continue
+                    softened.append(r)
+                ir[fld] = softened
+
             # 4b) location_visit_targets(目标点打卡): month/min_days正整数 + 坐标对成套或keyword
             #     二选一锚点 + radius缺省补 + quote回找。无任何锚点(坐标地名都没有)→降级 high unknown 交守护(§9.7)。
             kept = []
@@ -889,7 +1037,7 @@ class ModelDecisionService:
             cov_quotes = []
             for fld in ("rest_windows", "long_haul_limits", "cargo_targets", "cargo_max_limits",
                         "daily_order_caps", "off_day_requirements", "location_visit_targets",
-                        "region_avoid", "origin_avoid", "destination_prefer"):
+                        "home_curfews", "order_rules", "region_avoid", "origin_avoid", "destination_prefer"):
                 for e in ir.get(fld) or []:
                     if isinstance(e, dict):
                         q = _norm_text(str(e.get("source_quote", "")))
@@ -1102,6 +1250,11 @@ class ModelDecisionService:
                 break
         if self._matches_region_avoid(cand.cargo, pref_policy):
             vetoes.append("region_avoid")
+        if any(
+            str(rule.get("effect", "")).strip() == "hard_veto" and self._matches_order_rule(cand, rule)
+            for rule in self._order_rules(pref_policy)
+        ):
+            vetoes.append("order_rule_hard_veto")
         # 回家门禁型 候选 veto(两条件,全 try 守护防炸主线):
         # ①该单活动区间 [active_start, finish] 跨进任一门禁 quiet 窗 → 在外作业/在途=没在家 → veto(关键:挡跨夜/晚归单)。
         # ②完成后回家来不及(finish + ETA(终点→home) + margin > finish 所在日 deadline)→ veto。
@@ -1137,7 +1290,12 @@ class ModelDecisionService:
         self, cand: CandidateFact, pref_policy: dict[str, Any], ledger: dict[str, Any], sim_min: int
     ) -> float:
         active_min = max(1, cand.pickup_min + cand.wait_min + cand.transport_min)
-        net = cand.net_yuan_before_pref
+        order_penalty = sum(
+            float(rule.get("penalty_amount", 0) or 0)
+            for rule in self._order_rules(pref_policy)
+            if str(rule.get("effect", "")).strip() == "penalty" and self._matches_order_rule(cand, rule)
+        )
+        net = cand.net_yuan_before_pref - order_penalty
         nph = net / (active_min / 60.0)
         score = net + 5.0 * nph + 12.0 * cand.near_end_cargo_seen - 0.35 * cand.pickup_km
         score += self._target_bonus(cand, pref_policy, ledger, sim_min)
@@ -1273,6 +1431,7 @@ class ModelDecisionService:
         last_day = max(first_day, end_min // 1440 + 1)
         intervals: list[tuple[int, int]] = []
         for day in range(first_day, last_day + 1):
+            day_windows: list[tuple[dict[str, Any], int, int]] = []
             for window in windows:
                 if not self._window_applies_to_day(window, day):
                     continue
@@ -1292,6 +1451,15 @@ class ModelDecisionService:
                 e = day * 1440 + eh * 60
                 if e <= s:
                     e += 1440
+                day_windows.append((window, s, e))
+            specific = [
+                (s, e) for window, s, e in day_windows
+                if str(window.get("days", "all") or "all").lower() != "all"
+            ]
+            for window, s, e in day_windows:
+                is_all = str(window.get("days", "all") or "all").lower() == "all"
+                if is_all and any(_interval_overlap(s, e, ss, se) for ss, se in specific):
+                    continue  # 周末/工作日例外覆盖与其重叠的 all-days 基础窗
                 intervals.append((s, e))
         intervals.sort()
         return intervals
@@ -1406,6 +1574,50 @@ class ModelDecisionService:
         ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
         raw = ir.get("home_curfews") if isinstance(ir.get("home_curfews"), list) else []
         return [x for x in raw if isinstance(x, dict)]
+
+    @staticmethod
+    def _order_rules(pref_policy: dict[str, Any]) -> list[dict[str, Any]]:
+        ir = pref_policy.get("machine_ir") if isinstance(pref_policy.get("machine_ir"), dict) else {}
+        raw = ir.get("order_rules") if isinstance(ir.get("order_rules"), list) else []
+        return [x for x in raw if isinstance(x, dict)]
+
+    @staticmethod
+    def _matches_order_rule(cand: CandidateFact, rule: dict[str, Any]) -> bool:
+        field = str(rule.get("field", "") or "").strip()
+        op = str(rule.get("op", "") or "").strip()
+        target = rule.get("value")
+        start = cand.cargo.get("start") if isinstance(cand.cargo.get("start"), dict) else {}
+        end = cand.cargo.get("end") if isinstance(cand.cargo.get("end"), dict) else {}
+
+        def region_text(point: dict[str, Any]) -> str:
+            return " ".join(str(point.get(k, "") or "") for k in ("province", "city", "district", "address"))
+
+        values: dict[str, Any] = {
+            "cargo_name": ModelDecisionService._cargo_name(cand.cargo),
+            "start_region": region_text(start),
+            "end_region": region_text(end),
+            "either_region": f"{region_text(start)} {region_text(end)}",
+            "deadhead_km": cand.pickup_km,
+            "transport_minutes": cand.transport_min,
+        }
+        actual = values.get(field)
+        if actual is None:
+            return False
+        if op in ("contains", "equals"):
+            targets = target if isinstance(target, list) else [target]
+            if op == "contains":
+                return any(str(v).strip() and str(v).strip() in str(actual) for v in targets)
+            return any(str(actual) == str(v) for v in targets)
+        try:
+            left, right = float(actual), float(target)
+        except (TypeError, ValueError):
+            return False
+        return {
+            "gt": left > right,
+            "gte": left >= right,
+            "lt": left < right,
+            "lte": left <= right,
+        }.get(op, False)
 
     @staticmethod
     def _eta_between(from_lat: float, from_lng: float, to_lat: float, to_lng: float) -> int:
