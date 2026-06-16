@@ -1144,6 +1144,16 @@ class ModelDecisionService:
             if vetoes:
                 continue
             score = self._candidate_score(cand, pref_policy, ledger, sim_min)
+            # §7 配额熔断/认罚(仅 cargo_targets): 该单【靠配额bonus才被选(tb>0)】且【接它净亏、即便算上能省的
+            # 配额罚金仍亏】→ 认罚不接(防为凑稀缺配额过度抢单/接净亏单)。effective_bonus=min(raw_bonus,penalty_avoided)。
+            # 配额单净正(货源充足品类)恒 net+eff>0→不触发→不伤已履约配额。激进履约越猛, 此闸越关键。
+            tb, pen_avoided = self._target_bonus(cand, pref_policy, ledger, sim_min, return_penalty_avoided=True)
+            if tb > 0 and cand.net_yuan_before_pref + min(tb, pen_avoided) < 0:
+                self._logger.info(
+                    "config_fuse_refuse cargo=%s net=%.1f eff_bonus=%.1f",
+                    cand.cargo_id, cand.net_yuan_before_pref, min(tb, pen_avoided),
+                )
+                continue
             scored.append((score, cand, []))
 
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -1310,12 +1320,14 @@ class ModelDecisionService:
         return score
 
     def _target_bonus(
-        self, cand: CandidateFact, pref_policy: dict[str, Any], ledger: dict[str, Any], sim_min: int
-    ) -> float:
+        self, cand: CandidateFact, pref_policy: dict[str, Any], ledger: dict[str, Any], sim_min: int,
+        return_penalty_avoided: bool = False,
+    ):
         name = self._cargo_name(cand.cargo)
         if not name:
-            return 0.0
+            return (0.0, 0.0) if return_penalty_avoided else 0.0
         bonus = 0.0
+        pen_avoided = 0.0  # §7: 匹配欠额配额品类的单位罚额(接1单省的罚金), 供配额熔断算 effective_bonus
         counts = ledger.get("cargo_name_counts_by_month") or {}
         now_month = (_SIMULATION_EPOCH + timedelta(minutes=sim_min)).month
         for target in self._cargo_targets(pref_policy):
@@ -1333,6 +1345,7 @@ class ModelDecisionService:
             if shortfall <= 0:
                 continue
             penalty = self._target_penalty_amount(target, default=700.0)
+            pen_avoided = max(pen_avoided, penalty)  # §7: 取匹配欠额目标最高单位罚额
             days_left_factor = 1.0 + max(0, now_month - month + 1) * 0.35
             urgency_factor = 1.0
             if month == now_month:
@@ -1360,7 +1373,7 @@ class ModelDecisionService:
                 bonus += penalty * (1.0 + lam * shortfall) * days_left_factor * urgency_factor
             else:
                 bonus += (penalty + 0.12 * penalty * shortfall) * days_left_factor * urgency_factor
-        return bonus
+        return (bonus, pen_avoided) if return_penalty_avoided else bonus
 
     def _visit_target_bonus(
         self, cand: CandidateFact, pref_policy: dict[str, Any], ledger: dict[str, Any], sim_min: int

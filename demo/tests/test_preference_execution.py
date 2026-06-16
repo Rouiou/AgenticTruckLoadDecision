@@ -296,6 +296,44 @@ class TargetUrgencyTests(unittest.TestCase):
 
         self.assertGreater(late, early)
 
+    def test_target_bonus_returns_penalty_avoided_tuple(self) -> None:
+        # §7 配额熔断接口: return_penalty_avoided=True 返回 (bonus, pen_avoided);
+        # pen_avoided = 匹配欠额目标的单位罚额(接1单省的罚金)。默认仍返回 float(向后兼容)。
+        result = self.service._target_bonus(
+            candidate(cargo_name="测试货"), self.policy, self.ledger, 40 * 1440,
+            return_penalty_avoided=True,
+        )
+        self.assertIsInstance(result, tuple)
+        bonus, pen_avoided = result
+        self.assertGreater(bonus, 0.0)
+        self.assertEqual(pen_avoided, 500.0)
+        self.assertIsInstance(
+            self.service._target_bonus(candidate(cargo_name="测试货"), self.policy, self.ledger, 40 * 1440),
+            float,
+        )
+
+    def test_quota_fuse_refuses_net_negative_keeps_net_positive(self) -> None:
+        # §7 决策算术: 靠配额bonus才被选(tb>0)且接它净亏(net+min(bonus,pen_avoided)<0)→认罚不接;
+        # 货源充足品类(净正)恒 net+eff>=0→不触发→不伤已履约配额。
+        tb, pen_avoided = self.service._target_bonus(
+            candidate(cargo_name="测试货"), self.policy, self.ledger, 40 * 1440,
+            return_penalty_avoided=True,
+        )
+        self.assertGreater(tb, 0.0)
+        eff = min(tb, pen_avoided)
+        self.assertLess(-3000.0 + eff, 0.0)      # 净亏单 → 认罚不接
+        self.assertGreaterEqual(2000.0 + eff, 0.0)  # 净正单 → 保留
+
+    def test_quota_fuse_does_not_fire_without_shortfall(self) -> None:
+        # 配额已满(无欠额)→ tb=0、pen_avoided=0 → §7 闸门不触发(tb>0 为前置条件)。
+        ledger_full = {"cargo_name_counts_by_month": {"2026-04": {"测试货": 12}}}
+        tb, pen_avoided = self.service._target_bonus(
+            candidate(cargo_name="测试货"), self.policy, ledger_full, 40 * 1440,
+            return_penalty_avoided=True,
+        )
+        self.assertEqual(tb, 0.0)
+        self.assertEqual(pen_avoided, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
