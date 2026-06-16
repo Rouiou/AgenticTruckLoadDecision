@@ -347,6 +347,33 @@ class HomeCurfewTests(unittest.TestCase):
         self.assertEqual(action, {"action": "wait", "params": {"duration_minutes": 8 * 60}})
 
 
+class WaitProbeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.service = ModelDecisionService(api=None)
+        self.policy = {
+            "machine_ir": {
+                "rest_windows": [
+                    {"days": "all", "start_hour": 21, "end_hour": 6},
+                ]
+            }
+        }
+
+    def test_daytime_first_no_positive_waits_briefly_before_rescanning(self) -> None:
+        wait = self.service._next_useful_wait_minutes(6 * 60, self.policy, no_positive_streak=1)
+
+        self.assertEqual(wait, 60)
+
+    def test_repeated_no_positive_waits_back_off_to_normal_interval(self) -> None:
+        wait = self.service._next_useful_wait_minutes(6 * 60, self.policy, no_positive_streak=5)
+
+        self.assertEqual(wait, 120)
+
+    def test_near_rest_window_still_sleeps_through(self) -> None:
+        wait = self.service._next_useful_wait_minutes(20 * 60, self.policy, no_positive_streak=1)
+
+        self.assertEqual(wait, 10 * 60)
+
+
 class TargetUrgencyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = ModelDecisionService(api=None)

@@ -206,6 +206,7 @@ class ModelDecisionService:
         self._initial_position_by_driver: dict[str, tuple[float, float]] = {}
         # 每司机每仿真日 Council 调用计数(频率节流用)
         self._council_calls_by_driver_day: dict[tuple[str, int], int] = {}
+        self._no_positive_wait_streak_by_driver: dict[str, int] = {}
 
     def decide(self, driver_id: str) -> dict[str, Any]:
         self._cur_driver_id = driver_id  # 供打分层回查该司机的观测热点(影子价格机会数估计)
@@ -1165,6 +1166,7 @@ class ModelDecisionService:
 
         scored.sort(key=lambda item: item[0], reverse=True)
         if scored and scored[0][0] > 0:
+            self._no_positive_wait_streak_by_driver[driver_id] = 0
             best = scored[0][1]
             self._logger.info(
                 "deterministic_score_choice cargo=%s score=%.2f facts=%s",
@@ -1176,8 +1178,11 @@ class ModelDecisionService:
 
         repo = self._limited_reposition(driver_id, status, sim_min, pref_policy)
         if repo is not None:
+            self._no_positive_wait_streak_by_driver[driver_id] = 0
             return repo
-        wait = self._next_useful_wait_minutes(sim_min, pref_policy)
+        streak = self._no_positive_wait_streak_by_driver.get(driver_id, 0) + 1
+        self._no_positive_wait_streak_by_driver[driver_id] = streak
+        wait = self._next_useful_wait_minutes(sim_min, pref_policy, no_positive_streak=streak)
         wait = self._cap_wait_for_home(driver_id, status, sim_min, wait, pref_policy)
         self._logger.info("deterministic_wait no_positive_candidate wait=%s seen=%s", wait, len(candidates))
         return {"action": "wait", "params": {"duration_minutes": wait}}
@@ -1431,7 +1436,9 @@ class ModelDecisionService:
                 return max(1, min(_MAX_WAIT_MINUTES, end - sim_min))
         return None
 
-    def _next_useful_wait_minutes(self, sim_min: int, pref_policy: dict[str, Any]) -> int:
+    def _next_useful_wait_minutes(
+        self, sim_min: int, pref_policy: dict[str, Any], *, no_positive_streak: int = 0
+    ) -> int:
         next_rest = None
         for start, end in self._rest_intervals_around(sim_min, sim_min + 24 * 60, pref_policy):
             if sim_min < start:
@@ -1441,6 +1448,10 @@ class ModelDecisionService:
                 return max(1, end - sim_min)
         if next_rest and next_rest[0] - sim_min <= 240:
             return max(1, min(_MAX_WAIT_MINUTES, next_rest[1] - sim_min))
+        if no_positive_streak <= 2:
+            return 60
+        if no_positive_streak <= 4:
+            return 90
         return 120
 
     def _interval_overlaps_forbidden_window(self, start_min: int, end_min: int, pref_policy: dict[str, Any]) -> bool:
