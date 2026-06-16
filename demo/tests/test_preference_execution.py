@@ -357,6 +357,26 @@ class GuardedRepositionTests(unittest.TestCase):
         # 有 home 门禁约束 → 即便 flag 开也恒 no-op(防迁移撞门禁, §9.4)。
         self.assertIsNone(self._run({"home_curfews": [{"home_lat": 22.5, "home_lng": 113.5, "deadline_hour": 22}]}))
 
+    def test_guard2_blocks_inside_rest_window_but_fires_in_daytime(self) -> None:
+        # gate-fix: 查货扫描推进 sim 进作息窗后, ltd 绝不迁移(防窗内空驶=夜休违规); 安全时段才迁移。
+        from agent.model_decision_service import FEATURE_FLAGS
+        svc = self.service
+        svc._observed_points_by_driver["D"] = [{"lat": 23.0, "lng": 113.9, "price": 8000.0, "cargo_name": "x"}]
+        pol = {"machine_ir": {"rest_windows": [
+            {"label": "Night", "days": "weekday", "start_hour": 21, "end_hour": 6,
+             "forbid_take_order": True, "forbid_reposition": True}]}}
+        orig = FEATURE_FLAGS["ltd_reposition"]
+        FEATURE_FLAGS["ltd_reposition"] = True
+        try:
+            in_win = 64 * 1440 + 22 * 60    # 2026-05-04(周一) 22:00, 在 21-6 窗内
+            daytime = 64 * 1440 + 12 * 60   # 同日 12:00, 距 21:00 窗 540min>240
+            self.assertIsNone(svc._limited_reposition("D", self.status, in_win, pol))   # guard② 拦截窗内
+            res = svc._limited_reposition("D", self.status, daytime, pol)
+            self.assertIsNotNone(res)                          # 安全时段应能迁移(证明拦截来自 guard②)
+            self.assertEqual(res.get("action"), "reposition")
+        finally:
+            FEATURE_FLAGS["ltd_reposition"] = orig
+
 
 if __name__ == "__main__":
     unittest.main()

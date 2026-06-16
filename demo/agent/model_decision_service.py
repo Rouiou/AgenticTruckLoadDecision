@@ -1183,12 +1183,14 @@ class ModelDecisionService:
         治"冷区只能干等"的毛利黑洞;闸门保证不重蹈大空驶伤害。绝不抛异常。"""
         if not FEATURE_FLAGS.get("ltd_reposition"):
             return None
-        # guarded: 有 home门禁/整歇日【日历型位置约束】的司机一律不主动迁移——本执行器闸门只含 rest_windows、
-        # 不含 home_curfew/off_day, 迁移可能撞门禁/整歇日造违规(§9.4 互搏)。仅对无此类约束的司机 idle 时迁热点
-        # 捞毛利; 对有约束司机=安全 no-op(公开样例司机均有整歇日→恒 no-op, 故功能仅在隐藏集简单司机生效)。
+        # guard①: 有 home门禁/整歇日 的司机一律不主动迁移(这两类位置约束本执行器不单独并入闸门, 交其专属执行器处理)。
         if self._home_curfews(pref_policy) or self._off_day_requirements(pref_policy):
             return None
         try:
+            # guard②(gate-fix): decide 的 rest 检查在【查货前】跑, 而查货扫描会推进 sim_min——可能查货后才进作息/home窗。
+            # 补查"当前 sim_min 是否已落在某禁动段(作息∪home quiet)内", 在段内绝不迁移(否则迁移=窗内空驶=夜休违规)。
+            if self._no_go_segment_end(sim_min, pref_policy) is not None:
+                return None
             day = sim_min // 1440
             if self._last_reposition_day.get(driver_id) == day:
                 return None
