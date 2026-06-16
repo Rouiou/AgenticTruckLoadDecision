@@ -335,5 +335,28 @@ class TargetUrgencyTests(unittest.TestCase):
         self.assertEqual(pen_avoided, 0.0)
 
 
+class GuardedRepositionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.service = ModelDecisionService(api=None)
+        self.status = {"current_lat": 22.5, "current_lng": 113.5}
+
+    def _run(self, machine_ir: dict):
+        from agent.model_decision_service import FEATURE_FLAGS
+        orig = FEATURE_FLAGS["ltd_reposition"]
+        FEATURE_FLAGS["ltd_reposition"] = True
+        try:
+            return self.service._limited_reposition("D", self.status, 5000, {"machine_ir": machine_ir})
+        finally:
+            FEATURE_FLAGS["ltd_reposition"] = orig
+
+    def test_guard_blocks_driver_with_off_day(self) -> None:
+        # 有整歇日约束 → 即便 flag 开也恒 no-op(防迁移撞整歇日, §9.4)。
+        self.assertIsNone(self._run({"off_day_requirements": [{"min_off_days": 2}]}))
+
+    def test_guard_blocks_driver_with_home_curfew(self) -> None:
+        # 有 home 门禁约束 → 即便 flag 开也恒 no-op(防迁移撞门禁, §9.4)。
+        self.assertIsNone(self._run({"home_curfews": [{"home_lat": 22.5, "home_lng": 113.5, "deadline_hour": 22}]}))
+
+
 if __name__ == "__main__":
     unittest.main()

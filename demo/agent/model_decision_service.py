@@ -47,7 +47,7 @@ FEATURE_FLAGS = {
     "location_visit": True,         # 目标点打卡执行器(getter+visit_days按天去重+真达标bonus);死字段补全
     "recompile_stable_merge": True, # 跨月重编译保护: 稳定约束字段(作息/整歇/区域/长途/打卡)只增不减,防重编译非确定丢窗
     "home_curfew": True,            # P0-4 回家门禁: 每天回家执行器
-    "ltd_reposition": False,         # Day4: 受限reposition(三重闸门)
+    "ltd_reposition": True,          # guarded: 仅对【无home门禁/整歇日】司机 idle 时迁热点捞毛利(守门防§9.4违规;对有约束司机恒no-op)
     "dest_value": False,             # Day4: V落点价值表
     "aggressive_fulfill": True,      # 配速驱动履约: 落后线性配速即λ→1抢配额+提早定向广查
 }
@@ -1182,6 +1182,11 @@ class ModelDecisionService:
         ③最优观测热点的期望净值−迁移成本>200元。每日≤1次,迁移段不得与任何作息窗重叠。
         治"冷区只能干等"的毛利黑洞;闸门保证不重蹈大空驶伤害。绝不抛异常。"""
         if not FEATURE_FLAGS.get("ltd_reposition"):
+            return None
+        # guarded: 有 home门禁/整歇日【日历型位置约束】的司机一律不主动迁移——本执行器闸门只含 rest_windows、
+        # 不含 home_curfew/off_day, 迁移可能撞门禁/整歇日造违规(§9.4 互搏)。仅对无此类约束的司机 idle 时迁热点
+        # 捞毛利; 对有约束司机=安全 no-op(公开样例司机均有整歇日→恒 no-op, 故功能仅在隐藏集简单司机生效)。
+        if self._home_curfews(pref_policy) or self._off_day_requirements(pref_policy):
             return None
         try:
             day = sim_min // 1440
