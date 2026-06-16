@@ -365,6 +365,26 @@ class GuardedRepositionTests(unittest.TestCase):
         # 有 home 门禁约束 → 即便 flag 开也恒 no-op(防迁移撞门禁, §9.4)。
         self.assertIsNone(self._run({"home_curfews": [{"home_lat": 22.5, "home_lng": 113.5, "deadline_hour": 22}]}))
 
+    def test_aggressive_ltd_accepts_midrange_ev_hotspot_normal_rejects(self) -> None:
+        # I3: ltd_aggressive 把 EV 阈值 200→100。EV≈148 的中档热点(price420/dist~69km):
+        # 普通模式拒(EV<200), 激进模式接(EV>100)。更肥毛利高尾, gate/作息/≤1日 全保留。
+        from agent.model_decision_service import FEATURE_FLAGS
+        svc = self.service
+        svc._observed_points_by_driver["D"] = [{"lat": 23.0, "lng": 113.9, "price": 420.0, "cargo_name": "x"}]
+        pol = {"machine_ir": {}}                 # 无作息/home/off-day → 不被 guard 拦
+        sim = 64 * 1440 + 12 * 60                # daytime, 不在/不临近任何窗
+        ol = FEATURE_FLAGS["ltd_reposition"]; oa = FEATURE_FLAGS.get("ltd_aggressive", False)
+        FEATURE_FLAGS["ltd_reposition"] = True
+        try:
+            FEATURE_FLAGS["ltd_aggressive"] = False
+            self.assertIsNone(svc._limited_reposition("D", self.status, sim, pol))      # 普通: EV<200 → 拒
+            FEATURE_FLAGS["ltd_aggressive"] = True
+            res = svc._limited_reposition("D", self.status, sim, pol)
+            self.assertIsNotNone(res)                                                   # 激进: EV>100 → 接
+            self.assertEqual(res.get("action"), "reposition")
+        finally:
+            FEATURE_FLAGS["ltd_reposition"] = ol; FEATURE_FLAGS["ltd_aggressive"] = oa
+
     def test_guard2_blocks_inside_rest_window_but_fires_in_daytime(self) -> None:
         # gate-fix: 查货扫描推进 sim 进作息窗后, ltd 绝不迁移(防窗内空驶=夜休违规); 安全时段才迁移。
         from agent.model_decision_service import FEATURE_FLAGS

@@ -48,6 +48,7 @@ FEATURE_FLAGS = {
     "recompile_stable_merge": True, # 跨月重编译保护: 稳定约束字段(作息/整歇/区域/长途/打卡)只增不减,防重编译非确定丢窗
     "home_curfew": True,            # P0-4 回家门禁: 每天回家执行器
     "ltd_reposition": True,          # guarded: 仅对【无home门禁/整歇日】司机 idle 时迁热点捞毛利(守门防§9.4违规;对有约束司机恒no-op)
+    "ltd_aggressive": False,         # I3: ltd EV阈值 200→100(更易迁=更肥毛利高尾); 仅max-score多抽用, 不加超时/违规风险(gate全保留)
     "dest_value": False,             # Day4: V落点价值表
     "aggressive_fulfill": True,      # 配速驱动履约: 落后线性配速即λ→1抢配额+提早定向广查
 }
@@ -1180,7 +1181,7 @@ class ModelDecisionService:
         self, driver_id: str, status: dict[str, Any], sim_min: int, pref_policy: dict[str, Any]
     ) -> dict[str, Any] | None:
         """受限主动迁移(三重闸门): 仅当①无正分候选(调用处保证) ②距下一休息窗>240分钟
-        ③最优观测热点的期望净值−迁移成本>200元。每日≤1次,迁移段不得与任何作息窗重叠。
+        ③最优观测热点的期望净值−迁移成本>EV阈值(默认200; ltd_aggressive开则100=更肥毛利高尾)元。每日≤1次,迁移段不得与任何作息窗重叠。
         治"冷区只能干等"的毛利黑洞;闸门保证不重蹈大空驶伤害。绝不抛异常。"""
         if not FEATURE_FLAGS.get("ltd_reposition"):
             return None
@@ -1209,7 +1210,8 @@ class ModelDecisionService:
                 if nxt and sim_min + move_min + 120 > nxt[0]:
                     continue  # 迁移+起码2小时作业必须全部落在休息窗前
                 ev = float(p.get("price", 0)) * 0.6 - dist * _DEFAULT_COST_PER_KM
-                if ev > 200 and (best is None or ev > best[0]):
+                ev_floor = 100.0 if FEATURE_FLAGS.get("ltd_aggressive") else 200.0  # I3激进: 阈值降→更易迁=更肥高尾
+                if ev > ev_floor and (best is None or ev > best[0]):
                     best = (ev, p, dist)
             if best is None:
                 return None
