@@ -222,6 +222,45 @@ class RestWindowTests(unittest.TestCase):
 
         self.assertIn((24 * 60 + 21 * 60, 48 * 60 + 6 * 60), intervals)
 
+    def test_audit_keeps_weekend_delay_from_shifting_end_hour(self) -> None:
+        quote = "每天夜里二十一点到次日六点休息，但是周末可以晚两个小时再休息。"
+        policy = {
+            "machine_ir": {
+                "rest_windows": [
+                    {"days": "all", "start_hour": 21, "end_hour": 6, "source_quote": quote},
+                    {"days": "weekend", "start_hour": 23, "end_hour": 8, "source_quote": quote},
+                ]
+            }
+        }
+
+        audited = self.service._audit_policy("DTEST", policy, [{"content": quote}])
+        weekend = [w for w in audited["machine_ir"]["rest_windows"] if w["days"] == "weekend"][0]
+
+        self.assertEqual(weekend["start_hour"], 23)
+        self.assertEqual(weekend["end_hour"], 6)
+
+
+class UnknownCleanupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.service = ModelDecisionService(api=None)
+
+    def test_makeup_unknown_is_removed_when_quota_target_exists(self) -> None:
+        quote = "五月得把四月欠的单数接着补，五月建材必须接满十二单。"
+        policy = {
+            "machine_ir": {
+                "cargo_targets": [
+                    {"month": 5, "cargo_name": "建材", "min_count": 12, "source_quote": quote}
+                ],
+                "unknown_constraints": [
+                    {"preference_text": "四月欠的单数接着补", "why_unsupported": "makeup deficit", "risk_level": "high"}
+                ],
+            }
+        }
+
+        audited = self.service._audit_policy("DTEST", policy, [{"content": quote}])
+
+        self.assertEqual(audited["machine_ir"]["unknown_constraints"], [])
+
 
 class HomeCurfewTests(unittest.TestCase):
     def setUp(self) -> None:

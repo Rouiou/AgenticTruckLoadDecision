@@ -708,6 +708,19 @@ class ModelDecisionService:
                 w["days"] = d if d in ("all", "weekday", "weekend") else "all"
                 w["start_hour"], w["end_hour"] = sh, eh
                 kept.append(w)
+            base_windows = [w for w in kept if str(w.get("days")) in ("all", "weekday")]
+            for w in kept:
+                if str(w.get("days")) != "weekend":
+                    continue
+                quote = str(w.get("source_quote") or "")
+                if not any(token in quote for token in ("晚", "推迟", "延后", "delay", "later")):
+                    continue
+                for base in base_windows:
+                    same_quote = _norm_text(str(base.get("source_quote") or "")) == _norm_text(quote)
+                    if same_quote and int(base.get("end_hour")) != int(w.get("end_hour")):
+                        w["end_hour"] = int(base.get("end_hour"))
+                        self._logger.info("audit修正周末晚休只推迟开始、不顺延结束: end_hour=%s", w["end_hour"])
+                        break
             ir["rest_windows"] = kept
 
             # 2) cargo_targets / cargo_max_limits: month/数量/品类词表(snap)
