@@ -47,7 +47,7 @@ FEATURE_FLAGS = {
     "location_visit": True,         # 目标点打卡执行器(getter+visit_days按天去重+真达标bonus);死字段补全
     "recompile_stable_merge": True, # 跨月重编译保护: 稳定约束字段(作息/整歇/区域/长途/打卡)只增不减,防重编译非确定丢窗
     "home_curfew": True,            # P0-4 回家门禁: 每天回家执行器
-    "ltd_reposition": True,          # guarded: 仅对【无home门禁/整歇日】司机 idle 时迁热点捞毛利(守门防§9.4违规;对有约束司机恒no-op)
+    "ltd_reposition": False,         # J包关: §15实测ltd零增益(I3≡I2)+空驶冗余, 治超时包去掉最干净(§7上行独立保留)
     "ltd_aggressive": False,         # I3: ltd EV阈值 200→100(更易迁=更肥毛利高尾); 仅max-score多抽用, 不加超时/违规风险(gate全保留)
     "dest_value": False,             # Day4: V落点价值表
     "aggressive_fulfill": True,      # 配速驱动履约: 落后线性配速即λ→1抢配额+提早定向广查
@@ -371,9 +371,21 @@ class ModelDecisionService:
                 "例: 每天连续休息8小时→start_hour=0,end_hour=8。"
                 "每条约束必须输出 source_quote 字段=依据的偏好原文片段(逐字摘录,供审计回查)。"
                 "若原文暗示但未明说某约束(隐式约束),也要列出并标 low confidence,放入 unknown_constraints。"
-                "unknown_constraints 的 risk_level 严格区分:【需要 agent 采取额外行动才能满足】"
-                "(如每天至少 N 单、每隔 X 天回家、每天在线 X 小时)填 high;"
-                "只是对【已编译约束】的补充说明(罚款金额/周末定义/比上月罚得重/计数口径)填 low。"
+                "unknown_constraints 的 risk_level 必须【稳定、保守】分级(同一条偏好每次都应得到相同分级,不可时高时低):"
+                "【high 应当极少、通常为空】——只有当该约束 Council 在每一步【仅凭现有可见信息(当前位置/时间/星期/已接单台账/在途候选货源事实)就能判断此刻是否违反、且能通过'接某候选单'或'原地等待'直接执行】时才标 high。"
+                "凡满足下列任一者【一律不标 high】(标 high 会让每步空唤一个根本无法执行该约束的 Council、纯耗算力撞向单司机1小时超时上限、还会误杀本可接的好货源或逼出无谓等待):"
+                "①依赖 agent 运行时无法获取的外部信息(天气、路况、油价、各类预警、新闻、特定农历或节假日等运行时不可知状态)→ low;"
+                "②需主动预留未来整天或安排未来日程(每隔 X 天去某地报到、每月累计在线满 N 小时、周期性回某处)→ low,Council 每步无法管未来日程;"
+                "③依赖执行层没有的实时信号(连续驾驶时长、累计里程)→ low;"
+                "④无对应接单/等待动作可执行的软性习惯(优先某类客户、月末多接、收车报平安、定期保养洗车检查车况)→ low;"
+                "⑤顺序依赖偏好(当天第一单的类型、接某类货后若干小时内回避另一类)→ medium;"
+                "⑥已能编进任何标准字段的→不进 unknown(见下条铁律)。"
+                "只是对【已编译约束】的补充说明(罚款金额/周末定义/比上月罚得重/计数口径)→ low。"
+                "分级示例(虚构,仅示意稳定口径,勿照搬数字或词):"
+                "『每隔十二天要回登记地报到一次』→ low(需预留未来日程, Council 每步无法执行);"
+                "『遇到恶劣天气就不接需特别防护的货』→ low(天气运行时不可知);"
+                "『每天头一趟尽量接近途的』→ medium(顺序型, Council 可凭当日台账软性参考);"
+                "『收车前给家里报个平安』→ low(软性习惯, 无接单动作)。"
                 "【绝对禁止】把已经编进 rest_windows/cargo_targets/long_haul_limits/cargo_max_limits/"
                 "daily_order_caps/off_day_requirements/location_visit_targets/home_curfews/region_avoid 任一字段的偏好,再重复放进 unknown_constraints——那会导致同一约束被"
                 "结构化执行器和守护层重复处理。unknown_constraints 只放【上述字段都无法表达】的偏好。"
