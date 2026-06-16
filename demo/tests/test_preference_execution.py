@@ -262,6 +262,39 @@ class UnknownCleanupTests(unittest.TestCase):
         self.assertEqual(audited["machine_ir"]["unknown_constraints"], [])
 
 
+class TargetMonthAuditTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.service = ModelDecisionService(api=None)
+
+    def test_target_month_is_corrected_when_quote_names_one_month(self) -> None:
+        quote = "五月公司新指标，建材必须接满十二单。"
+        policy = {
+            "machine_ir": {
+                "cargo_targets": [
+                    {"month": 4, "cargo_name": "建材", "min_count": 12, "source_quote": quote}
+                ]
+            }
+        }
+
+        audited = self.service._audit_policy("DTEST", policy, [{"content": quote}])
+
+        self.assertEqual(audited["machine_ir"]["cargo_targets"][0]["month"], 5)
+
+    def test_target_month_is_not_changed_when_quote_mentions_multiple_months(self) -> None:
+        quote = "四月没完成，五月建材必须接满十二单。"
+        policy = {
+            "machine_ir": {
+                "cargo_targets": [
+                    {"month": 5, "cargo_name": "建材", "min_count": 12, "source_quote": quote}
+                ]
+            }
+        }
+
+        audited = self.service._audit_policy("DTEST", policy, [{"content": quote}])
+
+        self.assertEqual(audited["machine_ir"]["cargo_targets"][0]["month"], 5)
+
+
 class HomeCurfewTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = ModelDecisionService(api=None)

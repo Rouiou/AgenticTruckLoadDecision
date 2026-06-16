@@ -745,6 +745,10 @@ class ModelDecisionService:
                         if not (1 <= mon <= 12):
                             demote(t, f"{fld} month越界")
                             continue
+                        quote_month = self._unique_month_in_text(str(t.get("source_quote", "") or ""))
+                        if quote_month is not None and quote_month != mon:
+                            self._logger.info("audit修正%s月份: %s -> %s", fld, mon, quote_month)
+                            mon = quote_month
                         t["month"] = mon
                     try:
                         cnt = int(t.get(cnt_key))
@@ -2080,6 +2084,21 @@ class ModelDecisionService:
         except (TypeError, ValueError):
             return None
         return month if 1 <= month <= 12 else None
+
+    @staticmethod
+    def _unique_month_in_text(text: str) -> int | None:
+        text = str(text or "")
+        months: set[int] = set()
+        for match in __import__("re").finditer(r"(?<!\d)(1[0-2]|0?[1-9])\s*月", text):
+            months.add(int(match.group(1)))
+        zh_months = {
+            "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+            "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12,
+        }
+        for token, month in sorted(zh_months.items(), key=lambda item: len(item[0]), reverse=True):
+            if f"{token}月" in text:
+                months.add(month)
+        return next(iter(months)) if len(months) == 1 else None
 
     @staticmethod
     def _target_min_count(target: dict[str, Any]) -> int:
