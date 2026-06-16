@@ -1148,10 +1148,11 @@ class ModelDecisionService:
             # 配额罚金仍亏】→ 认罚不接(防为凑稀缺配额过度抢单/接净亏单)。effective_bonus=min(raw_bonus,penalty_avoided)。
             # 配额单净正(货源充足品类)恒 net+eff>0→不触发→不伤已履约配额。激进履约越猛, 此闸越关键。
             tb, pen_avoided = self._target_bonus(cand, pref_policy, ledger, sim_min, return_penalty_avoided=True)
-            if tb > 0 and cand.net_yuan_before_pref + min(tb, pen_avoided) < 0:
+            net_true = cand.net_yuan_before_pref - self._order_rule_penalty(cand, pref_policy)  # 与_candidate_score同口径(减order_rules可见罚)
+            if tb > 0 and net_true + min(tb, pen_avoided) < 0:
                 self._logger.info(
                     "config_fuse_refuse cargo=%s net=%.1f eff_bonus=%.1f",
-                    cand.cargo_id, cand.net_yuan_before_pref, min(tb, pen_avoided),
+                    cand.cargo_id, net_true, min(tb, pen_avoided),
                 )
                 continue
             scored.append((score, cand, []))
@@ -1303,16 +1304,19 @@ class ModelDecisionService:
                             break
         return vetoes
 
-    def _candidate_score(
-        self, cand: CandidateFact, pref_policy: dict[str, Any], ledger: dict[str, Any], sim_min: int
-    ) -> float:
-        active_min = max(1, cand.pickup_min + cand.wait_min + cand.transport_min)
-        order_penalty = sum(
+    def _order_rule_penalty(self, cand: CandidateFact, pref_policy: dict[str, Any]) -> float:
+        """命中的 penalty 型 order_rules 的可见罚金之和(打分减分 + §7 认罚同口径复用, 防两处口径漂移)。"""
+        return sum(
             float(rule.get("penalty_amount", 0) or 0)
             for rule in self._order_rules(pref_policy)
             if str(rule.get("effect", "")).strip() == "penalty" and self._matches_order_rule(cand, rule)
         )
-        net = cand.net_yuan_before_pref - order_penalty
+
+    def _candidate_score(
+        self, cand: CandidateFact, pref_policy: dict[str, Any], ledger: dict[str, Any], sim_min: int
+    ) -> float:
+        active_min = max(1, cand.pickup_min + cand.wait_min + cand.transport_min)
+        net = cand.net_yuan_before_pref - self._order_rule_penalty(cand, pref_policy)
         nph = net / (active_min / 60.0)
         score = net + 5.0 * nph + 12.0 * cand.near_end_cargo_seen - 0.35 * cand.pickup_km
         score += self._target_bonus(cand, pref_policy, ledger, sim_min)

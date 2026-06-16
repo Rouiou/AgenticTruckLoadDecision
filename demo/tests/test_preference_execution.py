@@ -339,6 +339,14 @@ class GuardedRepositionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = ModelDecisionService(api=None)
         self.status = {"current_lat": 22.5, "current_lng": 113.5}
+        # 播种一个高价值远热点: 无 guard 拦截时迁移【会】触发, 故下面 guard 测试的 None 必来自 guard、非空点(防假信心)。
+        self.service._observed_points_by_driver["D"] = [{"lat": 23.0, "lng": 113.9, "price": 8000.0, "cargo_name": "x"}]
+
+    def test_fires_without_calendar_constraint(self) -> None:
+        # 对照(证明 setUp 的热点+sim_min 在【无约束】时确实会迁移)→ 下面 guard 测试的 None 才证明是 guard 拦的。
+        res = self._run({})
+        self.assertIsNotNone(res)
+        self.assertEqual(res.get("action"), "reposition")
 
     def _run(self, machine_ir: dict):
         from agent.model_decision_service import FEATURE_FLAGS
