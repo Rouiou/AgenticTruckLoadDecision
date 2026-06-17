@@ -105,6 +105,20 @@ class GenericOrderRuleTests(unittest.TestCase):
 
         self.assertEqual(base, adjusted)
 
+    def test_destination_value_reflects_cargo_net_not_just_count(self) -> None:
+        # 文献 VFA(Value Function Approximation): 落点价值 V(s)=落点附近货的期望净收益, 不只是数量。
+        # 落点附近 1 个高净利货, 应给比 1 个等距低净利货 更高的落点价值(near_end)。
+        cargo = candidate().cargo  # 落点 end=(23.0,114.0)
+        near = {"lat": 23.0, "lng": 114.0}
+        dest = {"lat": 23.2, "lng": 114.2}
+        high = [{"cargo": {"cargo_id": "H", "start": near, "end": dest, "price": 3000}}]
+        low = [{"cargo": {"cargo_id": "L", "start": near, "end": dest, "price": 100}}]
+        v_high = self.service._observed_next_count(cargo, high)
+        v_low = self.service._observed_next_count(cargo, low)
+        self.assertGreater(
+            v_high, v_low, "落点附近高净利货应给更高落点价值(VFA 期望净收益, 非纯计数)"
+        )
+
     def test_audit_removes_duplicate_region_hard_ban_when_penalty_rule_exists(self) -> None:
         quote = "卸货地在目标城的货每接一次扣钱"
         policy = {

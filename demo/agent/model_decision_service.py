@@ -2549,23 +2549,29 @@ class ModelDecisionService:
             reasons.append("bad_duration")
         return not reasons, reasons
 
-    def _observed_next_count(self, cargo: dict[str, Any], items: list[dict[str, Any]]) -> int:
+    def _observed_next_count(self, cargo: dict[str, Any], items: list[dict[str, Any]]) -> float:
+        # 落点价值(VFA): 落点 120km 内货的【期望净收益】加权, 非纯计数(文献 INFORMS Transp.Sci./ADP-VFA:
+        # V(落点)=落点未来期望净收益, 高净利货的落点更有前瞻价值)。每货按净利潜力(price - haul*成本)归一化
+        # (/1500 capped 1), 保持量级~0-10 与原 +12*near_end 权重兼容。公开样例司机多跑实测 net 分布整体右移、高尾抬升。
         try:
             end_lat, end_lng = _cargo_point(cargo, "end")
         except Exception:
-            return 0
-        count = 0
+            return 0.0
+        value = 0.0
         for item in items:
             other = item.get("cargo") or {}
             if other.get("cargo_id") == cargo.get("cargo_id"):
                 continue
             try:
                 start_lat, start_lng = _cargo_point(other, "start")
+                o_end_lat, o_end_lng = _cargo_point(other, "end")
             except Exception:
                 continue
             if _haversine_km(end_lat, end_lng, start_lat, start_lng) <= 120:
-                count += 1
-        return count
+                o_haul = _haversine_km(start_lat, start_lng, o_end_lat, o_end_lng)
+                o_net = _cargo_price_yuan(other) - o_haul * _DEFAULT_COST_PER_KM
+                value += min(1.0, max(0.0, o_net / 1500.0))
+        return value
 
 
     def _remember_chosen_action(self, driver_id: str, action: dict[str, Any], candidates: list[CandidateFact]) -> None:
